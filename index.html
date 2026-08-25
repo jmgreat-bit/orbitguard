@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OrbitGuard — Autonomous CubeSat Flight Controller</title>
+  <link rel="stylesheet" href="/style.css">
+  <link
+    href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Share+Tech+Mono&display=swap"
+    rel="stylesheet">
+</head>
+
+<body>
+  <div id="app">
+    <!-- Top Bar -->
+    <header class="top-bar">
+      <div class="brand">
+        <span class="brand-icon">◈</span>
+        <h1>ORBITGUARD</h1>
+        <span class="tag">AUTONOMOUS AI</span>
+      </div>
+      <div class="mission-clock">
+        <span class="clock-label">MISSION</span>
+        <span class="clock-value" id="mission-time">T+00:00:00</span>
+      </div>
+      <div class="time-controls">
+        <button class="tc-btn" id="time-slower" title="Slow down">&#9664;</button>
+        <button class="tc-btn tc-speed" id="time-speed-btn" title="Cycle speed">
+          <span id="time-speed">1&times;</span>
+        </button>
+        <button class="tc-btn" id="time-faster" title="Speed up">&#9654;</button>
+      </div>
+    </header>
+
+    <!-- Page Content -->
+    <div id="page-content" class="page-content"></div>
+
+    <!-- Bottom Navigation -->
+    <nav class="bottom-nav">
+      <button class="nav-btn active" data-page="home" onclick="window.location.hash='home'">
+        <span class="nav-icon">HOM</span>
+        <span class="nav-label">Overview</span>
+      </button>
+      <button class="nav-btn" data-page="ship" onclick="window.location.hash='ship'">
+        <span class="nav-icon">SAT</span>
+        <span class="nav-label">Ship Health</span>
+      </button>
+      <button class="nav-btn" data-page="engine" onclick="window.location.hash='engine'">
+        <span class="nav-icon">ENG</span>
+        <span class="nav-label">Engine</span>
+      </button>
+      <button class="nav-btn" data-page="space" onclick="window.location.hash='space'">
+        <span class="nav-icon">SPC</span>
+        <span class="nav-label">Space</span>
+      </button>
+      <button class="nav-btn" data-page="crisis" onclick="window.location.hash='crisis'">
+        <span class="nav-icon">SOS</span>
+        <span class="nav-label">Crisis</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- Global Expansion Default Modal -->
+  <div id="card-modal" class="card-modal-overlay">
+    <div class="card-modal-content" id="card-modal-content">
+      <div class="card-modal-header">
+        <span class="card-modal-title" id="card-modal-title">TITLE</span>
+        <button class="card-modal-close" id="card-modal-close">&times;</button>
+      </div>
+      <div class="card-modal-body" id="card-modal-body">
+        <!-- Content injected dynamically -->
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+
+</html>
