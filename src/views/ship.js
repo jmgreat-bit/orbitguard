@@ -1,201 +1,189 @@
+// Satellite — the CubeSat in its real attitude over the real Earth, plus a subsystem inspector.
+import { app } from '../app.js';
 import { Satellite3D } from '../webgl/Satellite3D.js';
+import { THERMAL_LIMITS } from '../sim/thermal.js';
+import { esc, fmt, setText, label, thermalColor } from '../ui/dom.js';
+import { bindExplainers } from '../ui/modal.js';
 
-export function createShipView(satellite) {
-  const el = document.createElement('div');
-  el.className = 'view view-ship';
-  el.innerHTML = `
-    <div class="ship-layout">
-      <div class="ship-schematic-wrap" id="ship-3d-wrap" style="position:relative; width:100%; min-height:400px; display:flex; align-items:center; justify-content:center;">
-        <!-- 3D Canvas injected here -->
-      </div>
+const EXPLAIN = {
+    model: {
+        title: 'The 3D model',
+        html: `<p>Built to the 1U CubeSat envelope (10 × 10 × 11.35 cm on four rails) with two deployable solar wings, four UHF tape-measure antennas, an Earth camera and a cold-gas nozzle.</p>
+        <p>You are looking from the satellite's local frame: up is away from Earth and the blue Earth below is the actual ground under the satellite at this moment. Light comes from the Sun's true direction and goes out in eclipse. The yellow arrow points to the Sun, cyan along the direction of flight, blue down to Earth.</p>
+        <p><strong>Thermal</strong> colours each part by its temperature against that part's limits: blue cold, grey comfortable, red hot. <strong>X-ray</strong> shows the battery, computer boards, propellant tank and camera inside.</p>
+        <p>To use a real model, drop a <code>.glb</code> or <code>.gltf</code> file onto the view (NASA publishes free spacecraft models at <code>science.nasa.gov/3d-resources</code>).</p>`,
+    },
+    heat: {
+        title: 'Heat balance',
+        html: `<p>Each part is a thermal node: <code>C·dT/dt = heat in − heat out</code>. External surfaces absorb sunlight, infrared from Earth and reflected sunlight (albedo), and radiate to deep space as <code>εσAT⁴</code>. Electronics turn their electrical power into heat and conduct it into the structure.</p>
+        <p>Turning to <strong>sun-avoid</strong> points the white radiator face at the Sun and puts the wings edge-on, which cools the spacecraft but stops charging.</p>`,
+    },
+};
 
-      <!-- Section Inspector -->
-      <div class="section-inspector">
-        <div class="inspector-title" id="insp-title">SELECT A SECTION</div>
-        <div class="inspector-status" id="insp-status"></div>
-        <div class="inspector-grid" id="insp-grid">
-          <div class="insp-hint">Click any section on the schematic to inspect its data</div>
+const FIELD_LABELS = {
+    temperature: ['Temperature', v => `${v.toFixed(1)} °C`],
+    charge: ['Charge', v => `${v.toFixed(1)}%`], voltage: ['Voltage', v => `${v.toFixed(2)} V`],
+    currentDraw: ['Current (+ discharging)', v => `${v.toFixed(2)} A`], capacityWh: ['Capacity', v => `${v} Wh`],
+    healthPercent: ['Capacity health', v => `${v.toFixed(1)}%`], cycleCount: ['Charge cycles', v => `${v}`],
+    heaterOn: ['Heater', v => (v ? 'On' : 'Off')], chargeInhibited: ['Charging blocked (cold)', v => (v ? 'Yes' : 'No')],
+    efficiency: ['Output vs new', v => `${(v * 100).toFixed(0)}%`], angle: ['Sun angle off the cells', v => `${v}°`],
+    powerOutput: ['Power', v => `${v.toFixed(2)} W`], deployed: ['Deployed', v => (v ? 'Yes' : 'No')],
+    fuelMass: ['Propellant', v => `${v.toFixed(1)} g`], fuelPercent: ['Tank', v => `${v.toFixed(0)}%`],
+    pressure: ['Tank pressure', v => `${v.toFixed(2)} MPa`], nozzleTemp: ['Nozzle', v => `${v.toFixed(0)} °C`],
+    totalBurns: ['Burns', v => `${v}`], isThrusting: ['Firing', v => (v ? 'Yes' : 'No')], thrustN: ['Thrust', v => `${v} N`],
+    frequency: ['Frequency', v => `${v.toFixed(1)} MHz`], txPower: ['Transmit power', v => `${v.toFixed(1)} W`],
+    linkStatus: ['Link', v => v], station: ['Ground station', v => v || 'None in view'], dataRate: ['Data rate', v => `${v} bit/s`],
+    antennaOk: ['Radio', v => (v ? 'Working' : 'Locked up')], elevationDeg: ['Nearest station elevation', v => `${v.toFixed(1)}°`],
+    state: ['State', v => label(v)], powerDraw: ['Power draw', v => `${v.toFixed(2)} W`], imaging: ['Imaging now', v => (v ? 'Yes' : 'No')],
+    emissivity: ['Emissivity', v => v.toFixed(2)], heatRejection: ['Radiating to space', v => `${v.toFixed(1)} W`], heatStrapOk: ['Heat strap', v => (v ? 'OK' : 'Failed')],
+    cpuLoad: ['CPU', v => `${v.toFixed(0)}%`], memoryUsed: ['Memory', v => `${v.toFixed(0)}%`], uptimeHours: ['Uptime', v => fmt.dur(v * 3600)],
+    errorCount: ['Corrected upsets', v => `${v}`], throttled: ['Throttled', v => (v ? 'Yes' : 'No')],
+};
+
+export function createShipView() {
+    const el = document.createElement('div');
+    el.className = 'view split';
+    el.innerHTML = `
+    <section class="stage" id="ship-stage" aria-label="CubeSat 3D model">
+      <div class="stage-tools">
+        <div class="seg" role="group" aria-label="Colouring">
+          <button class="btn" data-mode="normal" aria-pressed="true">As built</button>
+          <button class="btn" data-mode="thermal" aria-pressed="false">Thermal</button>
         </div>
-
-        <!-- All sections summary -->
-        <div class="sections-summary" id="sections-summary"></div>
-
-        <!-- Thermodynamic & Power Equilibrium (New Math Feature) -->
-        <div class="eng-card bplane-card" id="card-therm" style="margin-top:20px;">
-          <div class="eng-card-header">
-            <span>THERMODYNAMIC EQUILIBRIUM</span>
-            <div class="card-btn-group">
-              <button class="btn-icon" id="btn-info-therm" title="What is this?">?</button>
-              <button class="btn-icon" id="btn-exp-therm" title="Expand View">↗</button>
-            </div>
-          </div>
-          <div class="eng-details" style="margin-top:10px;">
-            <div style="font-size:11px; color:var(--text-dim); margin-bottom:8px; letter-spacing:1px;">HEAT BALANCE (Q_in - Q_out)</div>
-            <div class="ed-row"><span>Internal Heat Gen.</span><span id="sh-heat-in">—</span></div>
-            <div class="ed-row"><span>Radiator Rejection</span><span id="sh-heat-out">—</span></div>
-            <div class="ed-row" style="border-top:1px solid rgba(0,255,255,0.15);padding-top:4px;margin-top:4px">
-              <span>Net Thermal Load</span>
-              <span id="sh-heat-net" style="font-weight:700">—</span>
-            </div>
-            <div class="ed-row" style="margin-top:8px">
-              <span style="color:var(--text-dim)">Est. Time to Runaway</span>
-              <span id="sh-heat-time" style="color:var(--amber)">—</span>
-            </div>
-          </div>
-        </div>
+        <button class="btn" id="opt-xray" aria-pressed="false">X-ray</button>
+        <button class="btn" id="opt-vec" aria-pressed="true">Vectors</button>
+        <label class="btn" for="glb-file">Load model…</label>
+        <input type="file" id="glb-file" accept=".glb,.gltf" hidden>
+        <button class="btn" id="glb-reset" hidden>Back to CubeSat</button>
+        <button class="explain" data-explain="model" aria-label="About this view">?</button>
       </div>
-    </div>
-  `;
+      <p class="stage-hint" id="stage-hint">Drag to look around, scroll to zoom, click a part to inspect it. Drop a .glb file here to fly your own model.</p>
+      <div class="stage-legend" id="stage-legend">
+        <span><i class="legend-line" style="background:var(--sun)"></i>To the Sun</span>
+        <span><i class="legend-line" style="background:var(--accent)"></i>Direction of flight</span>
+        <span><i class="legend-line" style="background:var(--cold)"></i>Down to Earth</span>
+      </div>
+      <div class="stage-legend" id="thermal-legend" hidden>
+        <div class="scale-bar"></div>
+        <div class="scale-ends"><span>Cold limit</span><span>Comfortable</span><span>Hot limit</span></div>
+      </div>
+    </section>
+    <aside class="side">
+      <section class="block">
+        <div class="block-head"><h2 class="inspect-title" id="insp-title">Satellite</h2><span class="tag" id="insp-status"></span></div>
+        <div class="rows" id="insp-rows"><p class="empty">Click a part of the model or a subsystem below.</p></div>
+      </section>
+      <section class="block">
+        <div class="block-head"><h3>Temperatures</h3><span class="block-note">Green band: comfortable range</span></div>
+        <div class="temp-list" id="temps"></div>
+      </section>
+      <section class="block">
+        <div class="block-head"><h3>Heat balance</h3><button class="explain" data-explain="heat" aria-label="About the heat balance">?</button></div>
+        <div class="rows">
+          <div class="row"><span>Electrical power turned into heat</span><span id="hb-elec">—</span></div>
+          <div class="row"><span>Sunlight heating the wings</span><span id="hb-sun">—</span></div>
+          <div class="row"><span>Radiated to space by the structure</span><span id="hb-rad">—</span></div>
+          <div class="row"><span>Attitude</span><span id="hb-att">—</span></div>
+        </div>
+      </section>
+    </aside>`;
 
-  let interval = null;
+    let interval, view, selected = null;
 
-  return {
-    element: el,
-    init() {
-      const container = el.querySelector('#ship-3d-wrap');
-      this.sat3D = new Satellite3D(
-        container,
-        null, // onHover
-        (key) => { this.inspect(key); }
-      );
+    const colors = (s) => Object.fromEntries(Object.entries(s).map(([k, v]) => [k, thermalColor(v.temperature, THERMAL_LIMITS[k])]));
 
-      interval = setInterval(() => this.update(), 1000);
-      this.update();
-
-      // Modal Hooks
-      import('../main.js').then(({ showModal }) => {
-        const thermInfo = `
-          <p><strong>Thermodynamic Heat Balance</strong></p>
-          <p>This model calculates the net thermal load acting on the satellite's core subsystems.</p>
-          <p>The equation used is: <span class="math-highlight">Q<sub>net</sub> = Q<sub>in</sub> - Q<sub>out</sub></span></p>
-          <ul>
-            <li><strong>Internal Heat Gen (Q<sub>in</sub>):</strong> Waste heat produced by active components, specifically the Onboard Computer (CPU load) and the Battery block ($I^2R$ losses).</li>
-            <li><strong>Radiator Rejection (Q<sub>out</sub>):</strong> The rate at which the Thermal Radiator array bleeds heat into the vacuum of space (dependent on active coolant pumps).</li>
-          </ul>
-          <p>If <span class="math-highlight">Q<sub>net</sub> > 0</span>, the core temperature rises. The <em>Est. Time to Runaway</em> projects when the CPU will hit its critical shutdown threshold of 85°C, resulting in total satellite bricking.</p>
-        `;
-
-        document.getElementById('btn-info-therm')?.addEventListener('click', () => {
-          showModal('THERMODYNAMIC EQUILIBRIUM', thermInfo, false);
-        });
-
-        document.getElementById('btn-exp-therm')?.addEventListener('click', () => {
-          const cardHtml = document.getElementById('card-therm').innerHTML;
-          showModal('THERMODYNAMIC EQUILIBRIUM', `<div class="expanded-card-view">${cardHtml}</div>`, true);
-        });
-      });
-    },
-    inspect(key) {
-      const state = satellite.getFullState();
-      const section = state.sections[key];
-      if (!section) return;
-
-      setText('insp-title', section.name);
-
-      const statusEl = document.getElementById('insp-status');
-      if (statusEl) {
-        statusEl.textContent = section.status.toUpperCase();
-        statusEl.className = 'inspector-status status-' + section.status;
-      }
-
-      const grid = document.getElementById('insp-grid');
-      if (!grid) return;
-      grid.innerHTML = '';
-
-      for (const [k, v] of Object.entries(section)) {
-        if (k === 'name') continue;
-        const row = document.createElement('div');
-        row.className = 'insp-row';
-
-        const label = k.replace(/([A-Z])/g, ' $1').toUpperCase();
-        let display;
-        if (typeof v === 'number') display = v % 1 === 0 ? String(v) : v.toFixed(2);
-        else if (typeof v === 'boolean') display = v ? '✓ ACTIVE' : '✗ OFF';
-        else if (v === null) display = '—';
-        else display = String(v);
-
-        const isWarning = (k === 'temperature' && (v > 60 || v < -10)) ||
-          (k === 'charge' && v < 25) ||
-          (k === 'fuelPercent' && v < 20) ||
-          (k === 'pressure' && v < 0.5);
-
-        row.innerHTML = `
-          <span class="insp-label">${label}</span>
-          <span class="insp-val ${isWarning ? 'val-warn' : ''}">${display}</span>
-        `;
-        grid.appendChild(row);
-      }
-    },
-    update() {
-      const state = satellite.getFullState();
-
-      // Update 3D Model
-      if (this.sat3D) {
-        this.sat3D.update(state.sections);
-      }
-
-      // Summary table
-      const summary = document.getElementById('sections-summary');
-      if (summary) {
-        summary.innerHTML = Object.entries(state.sections).map(([key, s]) => {
-          const statusColor = s.status === 'critical' ? 'var(--red)' : s.status === 'warning' ? 'var(--amber)' : 'var(--green)';
-          return `<div class="sum-row">
-            <span class="sum-dot" style="background:${statusColor}"></span>
-            <span class="sum-name">${s.name}</span>
-            <span class="sum-temp">${s.temperature.toFixed(0)}°C</span>
-          </div>`;
-        }).join('');
-      }
-
-      // Thermodynamic Equilibrium Math
-      // Rough estimation of heat generation based on active components
-      const obc = state.sections.onboardComputer;
-      const bat = state.sections.batteryBay;
-      const rad = state.sections.thermalRadiator;
-
-      // Heat generated = (CPU load * some factor) + (Battery current * voltage * inefficiency)
-      const heatIn = (obc.cpuLoad * 0.15) + (bat.currentDraw * bat.voltage * 0.2);
-      // Heat out = radiator rejection
-      const heatOut = rad.heatRejection * (rad.pumpActive ? 1 : 0.1);
-      const netHeat = heatIn - heatOut;
-
-      setText('sh-heat-in', `+ ${heatIn.toFixed(1)} W`);
-      setText('sh-heat-out', `- ${heatOut.toFixed(1)} W`);
-
-      const netEl = document.getElementById('sh-heat-net');
-      if (netEl) {
-        netEl.textContent = `${netHeat > 0 ? '+' : ''}${netHeat.toFixed(1)} W`;
-        netEl.style.color = netHeat > 0 ? 'var(--red)' : 'var(--cyan)';
-      }
-
-      const timeEl = document.getElementById('sh-heat-time');
-      if (timeEl) {
-        if (netHeat <= 0) {
-          timeEl.textContent = 'STABLE';
-          timeEl.style.color = 'var(--cyan)';
-        } else {
-          // Assume ~1000 Joules/K thermal mass for the core
-          // Time to hit 85C (critical) from current temp
-          const tempToCrit = 85 - obc.temperature;
-          if (tempToCrit <= 0) {
-            timeEl.textContent = 'CRITICAL RUNAWAY';
-            timeEl.style.color = 'var(--red)';
-          } else {
-            const secondsToCrit = (1000 * tempToCrit) / netHeat;
-            timeEl.textContent = `${(secondsToCrit / 60).toFixed(1)} MIN`;
-            timeEl.style.color = 'var(--amber)';
-          }
-        }
-      }
-    },
-    destroy() {
-      if (interval) clearInterval(interval);
-      if (this.sat3D) this.sat3D.destroy();
+    function inspect(key) {
+        selected = key;
+        renderInspector(app.sat.getFullState());
+        el.querySelectorAll('.temp-item').forEach(b => b.setAttribute('aria-current', String(b.dataset.key === key)));
     }
-  };
-}
 
-function setText(id, text) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = text;
+    function renderInspector(st) {
+        if (!selected) return;
+        const sec = st.sections[selected];
+        setText(el, '#insp-title', sec.name);
+        const tag = el.querySelector('#insp-status');
+        tag.dataset.status = sec.status;
+        tag.textContent = fmt.level[sec.status] || sec.status;
+        el.querySelector('#insp-rows').innerHTML = Object.entries(sec)
+            .filter(([k, v]) => FIELD_LABELS[k] && (v !== undefined && v !== null || k === 'station'))
+            .map(([k, v]) => `<div class="row"><span>${esc(FIELD_LABELS[k][0])}</span><span>${esc(FIELD_LABELS[k][1](v))}</span></div>`).join('');
+    }
+
+    function update() {
+        const st = app.sat.getFullState();
+        const s = st.sections;
+        const col = colors(s);
+        view?.update(st, col);
+
+        const list = el.querySelector('#temps');
+        if (!list.childElementCount) {
+            list.innerHTML = Object.entries(s).map(([k, sec]) => `<button class="temp-item" data-key="${k}" aria-current="false">
+              <span class="temp-name"><span class="tag"></span>${esc(sec.name)}</span>
+              <span class="temp-val"></span>
+              <span class="temp-track" aria-hidden="true"><i class="ok"></i><i class="now"></i></span>
+            </button>`).join('');
+            list.querySelectorAll('.temp-item').forEach(b => b.addEventListener('click', () => inspect(b.dataset.key)));
+        }
+        for (const b of list.children) {
+            const k = b.dataset.key, sec = s[k], L = THERMAL_LIMITS[k];
+            const pos = (v) => Math.max(0, Math.min(100, ((v - L.critLo) / (L.critHi - L.critLo)) * 100));
+            b.querySelector('.tag').dataset.status = sec.status;
+            b.querySelector('.temp-val').textContent = `${sec.temperature.toFixed(1)} °C`;
+            const ok = b.querySelector('.ok');
+            ok.style.left = `${pos(L.warnLo)}%`; ok.style.right = `${100 - pos(L.warnHi)}%`;
+            const now = b.querySelector('.now');
+            now.dataset.status = sec.status; now.style.left = `${pos(sec.temperature)}%`;
+            b.title = `${sec.name}: ${fmt.level[sec.status]}. Comfortable ${L.warnLo} to ${L.warnHi} °C, limits ${L.critLo} to ${L.critHi} °C.`;
+        }
+
+        const loads = st.power.loads;
+        setText(el, '#hb-elec', loads ? `${loads.total.toFixed(2)} W` : '—');
+        setText(el, '#hb-sun', st.environment.inSunlight ? `${(st.power.solarW / 0.29 * 0.91 - st.power.solarW).toFixed(1)} W` : 'None (eclipse)');
+        setText(el, '#hb-rad', `${s.thermalRadiator.heatRejection.toFixed(1)} W`);
+        setText(el, '#hb-att', label(st.attitude.mode));
+        renderInspector(st);
+    }
+
+    return {
+        element: el,
+        init() {
+            view = new Satellite3D(el.querySelector('#ship-stage'), { onPick: inspect });
+            el.querySelectorAll('[data-mode]').forEach(b => b.addEventListener('click', () => {
+                const thermal = b.dataset.mode === 'thermal';
+                el.querySelectorAll('[data-mode]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+                view.setOption('thermal', thermal, colors(app.sat.sections));
+                el.querySelector('#thermal-legend').hidden = !thermal;
+                el.querySelector('#stage-legend').hidden = thermal;
+            }));
+            const toggle = (id, key) => {
+                const b = el.querySelector(id);
+                b.addEventListener('click', () => {
+                    const on = b.getAttribute('aria-pressed') !== 'true';
+                    b.setAttribute('aria-pressed', String(on));
+                    view.setOption(key, on, colors(app.sat.sections));
+                });
+            };
+            toggle('#opt-xray', 'xray');
+            toggle('#opt-vec', 'vectors');
+            const file = el.querySelector('#glb-file');
+            const hint = el.querySelector('#stage-hint');
+            const reset = el.querySelector('#glb-reset');
+            const load = async (f) => {
+                try { hint.textContent = await view.loadModelFile(f); reset.hidden = false; }
+                catch (e) { hint.textContent = `Could not load that model: ${e.message}`; }
+            };
+            file.addEventListener('change', () => file.files[0] && load(file.files[0]));
+            el.querySelector('#ship-stage').addEventListener('drop', () => { reset.hidden = false; });
+            reset.addEventListener('click', () => { view.resetModel(); reset.hidden = true; hint.textContent = 'Back to the procedural CubeSat.'; });
+            bindExplainers(el, EXPLAIN);
+            update();
+            inspect('batteryBay');
+            interval = setInterval(update, 500);
+        },
+        destroy() {
+            clearInterval(interval);
+            view?.destroy();
+        },
+    };
 }

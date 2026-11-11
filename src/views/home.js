@@ -1,291 +1,227 @@
-// HOME VIEW — Overview dashboard with key readings
-import { dragDecayRate } from '../physics.js';
+// Overview — the real-time Earth and orbit, with the readings that matter at a glance.
+import { app } from '../app.js';
+import { MISSION_LOG, onLog } from '../log.js';
+import { OrbitScene } from '../webgl/OrbitScene.js';
+import { esc, fmt, setText, label, describeCommand, drawSparkline } from '../ui/dom.js';
+import { bindExplainers } from '../ui/modal.js';
 
-export function createHomeView(satellite) {
-  const el = document.createElement('div');
-  el.className = 'view view-home';
-  el.innerHTML = `
-    <div class="home-grid">
-      <!-- Big Readouts -->
-      <div class="big-readout">
-        <div class="readout-label">ALTITUDE</div>
-        <div class="readout-value" id="h-altitude">420</div>
-        <div class="readout-unit">km</div>
-      </div>
-
-      <div class="big-readout">
-        <div class="readout-label">VELOCITY</div>
-        <div class="readout-value" id="h-velocity">7.66</div>
-        <div class="readout-unit">km/s</div>
-      </div>
-
-      <div class="big-readout">
-        <div class="readout-label">GRAVITY</div>
-        <div class="readout-value" id="h-gravity">8.66</div>
-        <div class="readout-unit">m/s²</div>
-      </div>
-
-      <div class="big-readout">
-        <div class="readout-label">ORBIT</div>
-        <div class="readout-value" id="h-orbit">#1847</div>
-        <div class="readout-unit">revolution</div>
-      </div>
-
-      <!-- Status Row -->
-      <div class="status-row">
-        <div class="status-pill" id="h-sun">
-          <span class="pill-icon">SUN</span>
-          <span class="pill-text" id="h-sun-text">SUNLIT</span>
-        </div>
-        <div class="status-pill" id="h-comm">
-          <span class="pill-icon">COMM</span>
-          <span class="pill-text" id="h-comm-text">WEAK LINK</span>
-        </div>
-        <div class="status-pill" id="h-ai-status">
-          <span class="pill-icon">AI</span>
-          <span class="pill-text">ACTIVE</span>
-        </div>
-      </div>
-
-      <!-- Survival Score -->
-      <div class="home-survival">
-        <div class="surv-ring" id="h-surv-ring">
-          <svg viewBox="0 0 120 120" class="ring-svg">
-            <circle cx="60" cy="60" r="52" class="ring-bg"/>
-            <circle cx="60" cy="60" r="52" class="ring-fg" id="h-ring-fg"
-              stroke-dasharray="326.7" stroke-dashoffset="58"/>
-          </svg>
-          <div class="ring-text">
-            <div class="ring-value" id="h-score">82%</div>
-            <div class="ring-label">SURVIVAL</div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Orbital Decay Forecast (New Math Feature) -->
-      <div class="home-decay eng-card" id="card-decay">
-        <div class="eng-card-header" style="margin-bottom:6px">
-          <span>ORBITAL DECAY FORECAST</span>
-          <div class="card-btn-group">
-            <button class="btn-icon" id="btn-info-decay" title="What is this?">?</button>
-            <button class="btn-icon" id="btn-exp-decay" title="Expand View">↗</button>
-          </div>
-        </div>
-        <div class="decay-stats" style="display:flex; justify-content:space-between; margin-bottom: 8px;">
-          <div>
-            <div class="qs-label">DRAG RATE</div>
-            <div class="qs-val" id="h-decay-rate" style="font-size:16px;">--</div>
-          </div>
-          <div style="text-align:right">
-            <div class="qs-label">TIME TO < 200KM</div>
-            <div class="qs-val" id="h-decay-time" style="font-size:16px; color:var(--amber)">--</div>
-          </div>
-        </div>
-        <div class="decay-bar-wrap" style="height:4px; background:rgba(255,255,255,0.1); border-radius:2px; overflow:hidden;">
-          <div id="h-decay-bar" style="height:100%; width:100%; background:var(--cyan); transition:width 1s linear;"></div>
-        </div>
-        <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--text-dim); margin-top:4px;">
-          <span>Current (420km)</span>
-          <span>Critical (200km)</span>
-        </div>
-      </div>
-
-      <!-- Quick Stats -->
-      <div class="quick-stats">
-        <div class="qs">
-          <span class="qs-label">BATTERY</span>
-          <span class="qs-val" id="h-bat">73%</span>
-        </div>
-        <div class="qs">
-          <span class="qs-label">FUEL</span>
-          <span class="qs-val" id="h-fuel">92%</span>
-        </div>
-        <div class="qs">
-          <span class="qs-label">TEMP AVG</span>
-          <span class="qs-val" id="h-temp">34°C</span>
-        </div>
-        <div class="qs">
-          <span class="qs-label">RADIATION</span>
-          <span class="qs-val" id="h-rad">0.15</span>
-        </div>
-      </div>
-
-      <!-- AI Decision Log -->
-      <div class="home-ai-box">
-        <div class="ai-box-header">
-          <span class="ai-box-label">AUTONOMOUS DECISION LOG</span>
-          <span class="ai-threat-badge" id="h-threat-badge">NOMINAL</span>
-        </div>
-        <div class="ai-log-scroll" id="h-ai-log"></div>
-        <div class="ai-forecast" id="h-forecast">Awaiting AI assessment...</div>
-      </div>
-    </div>
-  `;
-
-  let interval = null;
-
-  return {
-    element: el,
-    _logHandler: null,
-    init() {
-      interval = setInterval(() => this.update(), 1000);
-      this.update();
-      this._renderLog();
-      this._logHandler = () => this._renderLog();
-      window.addEventListener('ai-decision', this._logHandler);
-
-      // Modal Hooks
-      import('../main.js').then(({ showModal }) => {
-        const decayInfo = `
-          <p><strong>Atmospheric Drag Model</strong></p>
-          <p>This projection calculates the aerodynamic drag force ($F_{drag}$) acting on the satellite as it moves through the upper thermosphere.</p>
-          <p>The time-to-decay is estimated by integrating the current <span class="math-highlight">drag rate (m/day)</span> until the satellite reaches the critical 200km altitude boundary, where atmospheric friction will cause a rapid, unrecoverable deorbit.</p>
-          <p><strong>Variables:</strong></p>
-          <ul>
-            <li><strong>Current Solar Flux (SFU):</strong> Higher solar activity expands the Earth's atmosphere upwards, exponentially increasing drag.</li>
-            <li><strong>Geomagnetic Kp Index:</strong> Solar storms heat the atmosphere, dramatically increasing density and drag rates at Low Earth Orbit (LEO).</li>
-          </ul>
-        `;
-
-        document.getElementById('btn-info-decay')?.addEventListener('click', () => {
-          showModal('ORBITAL DECAY FORECAST', decayInfo, false);
-        });
-
-        document.getElementById('btn-exp-decay')?.addEventListener('click', () => {
-          const cardHtml = document.getElementById('card-decay').innerHTML;
-          showModal('ORBITAL DECAY FORECAST', `<div class="expanded-card-view">${cardHtml}</div>`, true);
-        });
-      });
+const EXPLAIN = {
+    orbit: {
+        title: 'Orbit and decay',
+        html: `<p>The satellite flies a near-circular orbit. Its <strong>mean altitude</strong> is the orbit radius minus Earth's mean radius. The <strong>height above the ground</strong> changes by about 13 km around each orbit because Earth is flatter at the poles (WGS-84 ellipsoid).</p>
+        <p>Thin air at this height drags on the satellite. The orbit shrinks at <code>dr/dt = −ρ·Cd·(A/m)·v·r</code>, faster when solar activity (F10.7) and geomagnetic storms (Kp) heat the upper atmosphere.</p>
+        <p>The lifetime estimate integrates that decay down to 200 km, accounting for the denser air lower down.</p>`,
     },
-    update() {
-      const state = satellite.getFullState();
-      const env = state.environment;
-      const s = state.sections;
-
-      setText('h-altitude', env.altitude.toFixed(0));
-      setText('h-velocity', env.velocity.toFixed(2));
-      setText('h-gravity', env.gravity.toFixed(2));
-      setText('h-orbit', `#${state.orbit.orbitNumber}`);
-
-      // Sun status
-      const sunEl = document.getElementById('h-sun-text');
-      if (sunEl) {
-        sunEl.textContent = env.inSunlight ? 'SUNLIT' : 'SHADOW';
-        sunEl.parentElement.classList.toggle('pill-warning', !env.inSunlight);
-      }
-
-      // Comm
-      const commEl = document.getElementById('h-comm-text');
-      if (commEl) {
-        commEl.textContent = s.commArray.linkStatus + ' LINK';
-        commEl.parentElement.classList.toggle('pill-warning', s.commArray.linkStatus === 'LOST');
-      }
-
-      // Survival
-      const score = state.survivalScore;
-      setText('h-score', `${score}%`);
-      const ring = document.getElementById('h-ring-fg');
-      if (ring) {
-        const offset = 326.7 * (1 - score / 100);
-        ring.style.strokeDashoffset = offset;
-        ring.style.stroke = score > 60 ? 'var(--cyan)' : score > 30 ? 'var(--amber)' : 'var(--red)';
-      }
-
-      // Orbital Decay Math
-      // Uses drag decay rate (km/s) from physics.js
-      const decayKps = dragDecayRate(
-        env.altitude, env.velocity * 1000,
-        satellite.physics.Cd, satellite.physics.Am, env.geomagneticIndex
-      );
-      // convert km/s to meters/day
-      const decayMetersPerDay = Math.abs(decayKps) * 1000 * 86400;
-      setText('h-decay-rate', `-${decayMetersPerDay.toFixed(1)} m/day`);
-
-      const altToLose = env.altitude - 200; // drops dead at 200km
-      if (altToLose <= 0) {
-        setText('h-decay-time', 'IMMINENT');
-        if (document.getElementById('h-decay-bar')) document.getElementById('h-decay-bar').style.width = '0%';
-      } else {
-        const daysLeft = (altToLose * 1000) / (decayMetersPerDay || 1);
-        const yearsLeft = daysLeft / 365;
-
-        // Cap display — thousands of years is physically correct but useless
-        if (yearsLeft > 100) {
-          setText('h-decay-time', 'STABLE ORBIT');
-          // Also make drag rate more readable when negligible
-          if (decayMetersPerDay < 0.1) setText('h-decay-rate', '~0.0 m/day');
-        } else if (yearsLeft > 1) {
-          setText('h-decay-time', `${yearsLeft.toFixed(1)} YEARS`);
-        } else if (daysLeft > 1) {
-          setText('h-decay-time', `${daysLeft.toFixed(0)} DAYS`);
-        } else {
-          const hoursLeft = daysLeft * 24;
-          setText('h-decay-time', `${hoursLeft.toFixed(1)} HOURS`);
-        }
-
-        const startAlt = satellite.orbit?.baseAltitude || 420;
-        const pct = Math.max(0, Math.min(100, (altToLose / (startAlt - 200)) * 100));
-        const bar = document.getElementById('h-decay-bar');
-        if (bar) {
-          bar.style.width = `${pct}%`;
-          bar.style.background = pct > 50 ? 'var(--cyan)' : pct > 20 ? 'var(--amber)' : 'var(--red)';
-        }
-      }
-
-
-      // Quick stats
-      setText('h-bat', `${Math.round(s.batteryBay.charge)}%`);
-      setText('h-fuel', `${Math.round(s.thrusterPod.fuelPercent)}%`);
-      const avgTemp = Object.values(s).reduce((sum, sec) => sum + sec.temperature, 0) / Object.keys(s).length;
-      setText('h-temp', `${avgTemp.toFixed(0)}°C`);
-      setText('h-rad', env.radiationLevel.toFixed(2));
-
-      // Color code radiation
-      const radEl = document.getElementById('h-rad');
-      if (radEl) radEl.style.color = env.radiationLevel > 0.5 ? 'var(--red)' : 'var(--cyan)';
-      // Threat badge
-      const threat = satellite._lastThreat || 'nominal';
-      const tColors = { nominal: '#00ccff', caution: '#00ff88', warning: '#ffdd00', critical: '#ff2244' };
-      const badge = document.getElementById('h-threat-badge');
-      if (badge) {
-        badge.textContent = threat.toUpperCase();
-        badge.style.background = tColors[threat] || '#00ccff';
-        badge.style.color = '#000';
-      }
-      if (satellite._lastForecast) {
-        const fc = document.getElementById('h-forecast');
-        if (fc) fc.textContent = satellite._lastForecast;
-      }
+    health: {
+        title: 'Survival score',
+        html: `<p>Starts at 100. Each subsystem outside its comfortable temperature band or in a fault costs 5 (warning) or 15 (critical). A conjunction above Pc 1e-5 costs 10, above 1e-4 costs 25. Radiation above 0.5 mSv/h costs 10, and an orbit below 250 km costs 20.</p>`,
     },
-    _renderLog() {
-      // Import AI_LOG lazily from the module scope
-      const logEl = document.getElementById('h-ai-log');
-      if (!logEl) return;
-      // Read from window.__aiLog set by ai-brain
-      const log = window.__AI_LOG || [];
-      const colors = { nominal: '#00ccff', caution: '#00ff88', warning: '#ffdd00', critical: '#ff2244', normal: '#00ccff', high: '#ffdd00', emergency: '#ff2244' };
-      logEl.innerHTML = log.slice(0, 6).map(entry => {
-        const color = colors[entry.threat_level?.toLowerCase()] || '#aaa';
-        const icon = ['MAINTAIN', 'coast'].includes(entry.action) ? '||' :
-          ['EVENT', 'CME_ALERT', 'CME_IMPACT'].includes(entry.action) ? '!!' :
-            entry.action === 'FORECAST' ? '--' :
-              ['FACE_SUN', 'FACE_SHADOW', 'FACE_EARTH'].includes(entry.action) ? '⟳' :
-                entry.action === 'BURN' ? '🔥' :
-                  entry.action === 'AI_ONLINE' ? 'OK' : '>>';
-        return `<div class="h-log-row" style="border-left:2px solid ${color}">
-            <span style="color:${color};font-weight:700">${icon} ${entry.action}</span>
-            <span class="h-log-reason">${entry.reason}</span>
-          </div>`;
-      }).join('');
+    autonomy: {
+        title: 'How the satellite decides',
+        html: `<p>A <strong>planner</strong> proposes a short plan in JSON: Gemini when the local server has an API key, otherwise the rule-based autopilot. The <strong>flight controller</strong> validates every command, runs the plan step by step on simulation time, and aligns the thruster before any burn.</p>
+        <p>A <strong>safety supervisor</strong> watches battery and temperatures. When a hard limit is crossed it applies a safe configuration itself and vetoes any command that would undo it, until conditions recover.</p>`,
     },
-    destroy() {
-      if (interval) clearInterval(interval);
-      if (this._logHandler) window.removeEventListener('ai-decision', this._logHandler);
+};
+
+const SHORT = {
+    solarPanelA: 'Wing A', solarPanelB: 'Wing B', batteryBay: 'Battery', thrusterPod: 'Thruster',
+    commArray: 'Radio', payloadBay: 'Camera', thermalRadiator: 'Structure', onboardComputer: 'Computer',
+};
+
+export function createHomeView() {
+    const el = document.createElement('div');
+    el.className = 'view overview';
+    el.innerHTML = `
+    <section class="hero" aria-label="Earth and orbit, live">
+      <div class="hero-info">
+        <p class="hero-where" id="h-where">—</p>
+        <div class="hero-tags">
+          <span class="tag" id="h-sun">—</span>
+          <span class="tag" id="h-comm">—</span>
+          <span class="tag" id="h-att">—</span>
+        </div>
+      </div>
+      <div class="hero-tools">
+        <div class="seg" role="group" aria-label="Camera">
+          <button class="btn" id="cam-earth" aria-pressed="true">Whole Earth</button>
+          <button class="btn" id="cam-sat" aria-pressed="false">Follow satellite</button>
+        </div>
+      </div>
+      <div class="hero-legend">
+        <span><i class="legend-line" style="background:var(--accent)"></i>Orbit</span>
+        <span><i class="legend-line" style="background:var(--good)"></i>Ground-station link</span>
+        <span><i class="legend-line" style="background:var(--critical)"></i>Debris track, near closest approach</span>
+      </div>
+    </section>
+
+    <aside class="rail">
+      <section class="block">
+        <div class="block-head"><h2>Orbit</h2><button class="explain" data-explain="orbit" aria-label="About the orbit numbers">?</button></div>
+        <div class="alt-hero"><span id="h-alt">—</span><small>km</small></div>
+        <p class="alt-sub" id="h-alt-sub">—</p>
+        <div class="rows">
+          <div class="row"><span>Speed</span><span id="h-vel">—</span></div>
+          <div class="row"><span>One orbit takes</span><span id="h-period">—</span></div>
+          <div class="row"><span>Losing altitude</span><span id="h-decay">—</span></div>
+          <div class="row"><span>Time left in orbit</span><span id="h-life">—</span></div>
+        </div>
+      </section>
+
+      <section class="block">
+        <div class="block-head"><h2>Health</h2><button class="explain" data-explain="health" aria-label="About the survival score">?</button></div>
+        <div class="health">
+          <div class="ring" id="h-ring">
+            <svg viewBox="0 0 100 100" aria-hidden="true"><circle class="bg" cx="50" cy="50" r="42"/><circle class="fg" id="h-ring-fg" cx="50" cy="50" r="42" stroke-dasharray="263.9" stroke-dashoffset="0"/></svg>
+            <div class="ring-val"><b id="h-score">—</b><span>survival</span></div>
+          </div>
+          <div class="subsys" id="h-subsys"></div>
+        </div>
+      </section>
+
+      <section class="block">
+        <div class="block-head"><h2>Autonomy</h2><button class="explain" data-explain="autonomy" aria-label="How decisions are made">?</button></div>
+        <p class="planner-line" id="h-planner">—</p>
+        <div id="h-plan"></div>
+      </section>
+
+      <section class="block">
+        <div class="block-head"><h2>Latest events</h2><a class="block-note" href="#crisis">Full log</a></div>
+        <ul class="log" id="h-log"></ul>
+      </section>
+    </aside>
+
+    <section class="strip" aria-label="Key telemetry">
+      <div>
+        <div class="strip-label"><span>Battery</span><span id="h-bat-state"></span></div>
+        <div class="big" id="h-bat">—</div>
+        <div class="spark"><canvas id="sp-bat" aria-label="Battery charge, last hours"></canvas><div class="spark-readout"></div></div>
+      </div>
+      <div>
+        <div class="strip-label"><span>Solar power</span><span id="h-inc"></span></div>
+        <div class="big" id="h-solar">—</div>
+        <div class="spark"><canvas id="sp-solar" aria-label="Solar power, last hours"></canvas><div class="spark-readout"></div></div>
+      </div>
+      <div>
+        <div class="strip-label"><span>Propellant</span></div>
+        <div class="big" id="h-dv">—</div>
+        <div class="meter" id="h-fuel-m"><i></i></div>
+        <div class="spark-readout" id="h-fuel"></div>
+      </div>
+      <div>
+        <div class="strip-label"><span>Highest collision risk</span></div>
+        <div class="big" id="h-pc">—</div>
+        <div class="spark-readout" id="h-pc-sub"></div>
+      </div>
+      <div>
+        <div class="strip-label"><span>Radiation</span><span id="h-saa"></span></div>
+        <div class="big" id="h-rad">—</div>
+        <div class="spark"><canvas id="sp-rad" aria-label="Dose rate, last hours"></canvas><div class="spark-readout"></div></div>
+      </div>
+    </section>`;
+
+    let interval, unsub, scene;
+
+    function renderLog() {
+        const ul = el.querySelector('#h-log');
+        ul.innerHTML = MISSION_LOG.slice(0, 6).map(e => `
+          <li data-level="${esc(e.level)}">
+            <div class="log-head"><span class="log-action">${esc(e.action)}</span><span class="log-meta">${esc(fmt.clock(e.missionTime))}, ${esc(e.source)}</span></div>
+            <div class="log-reason">${esc(e.reason)}</div>
+          </li>`).join('') || '<li class="empty">Nothing yet.</li>';
     }
-  };
-}
 
-function setText(id, text) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = text;
+    function update() {
+        const st = app.sat.getFullState();
+        const env = st.environment, o = st.orbit, s = st.sections;
+        scene?.update(st, app.paused ? 0 : app.warp);
+
+        const ns = o.latitude >= 0 ? 'N' : 'S', ew = o.longitude >= 0 ? 'E' : 'W';
+        setText(el, '#h-where', `Over ${Math.abs(o.latitude).toFixed(1)}° ${ns}, ${Math.abs(o.longitude).toFixed(1)}° ${ew}`);
+        const sun = el.querySelector('#h-sun');
+        sun.dataset.status = env.inSunlight ? 'sun' : 'caution';
+        sun.textContent = env.inSunlight
+            ? `Sunlit, eclipse in ${o.timeToNextEclipse == null ? '—' : fmt.dur(o.timeToNextEclipse * 60)}`
+            : `In Earth's shadow, sunrise in ${fmt.dur((o.timeToSunrise || 0) * 60)}`;
+        const comm = el.querySelector('#h-comm');
+        const c = s.commArray;
+        comm.dataset.status = !c.antennaOk ? 'critical' : c.station ? 'good' : '';
+        comm.textContent = !c.antennaOk ? 'Radio not transmitting'
+            : c.station ? `Talking to ${c.station}` : o.timeToNextContact == null ? 'No ground pass in 24 h' : `Next ground pass in ${fmt.dur(o.timeToNextContact * 60)}`;
+        setText(el, '#h-att', `${label(st.attitude.mode)}${st.attitude.pointingErrorDeg > 2 ? `, turning (${st.attitude.pointingErrorDeg.toFixed(0)}° to go)` : ''}`);
+
+        setText(el, '#h-alt', o.baseAltitude.toFixed(1));
+        setText(el, '#h-alt-sub', `Mean altitude. ${env.altitude.toFixed(1)} km above the ground right now.`);
+        setText(el, '#h-vel', `${env.velocity.toFixed(3)} km/s`);
+        setText(el, '#h-period', `${o.period.toFixed(1)} min`);
+        setText(el, '#h-decay', `${Math.abs(env.decayRateKmPerDay * 1000).toFixed(0)} m per day`);
+        setText(el, '#h-life', fmt.days(env.lifetimeDays));
+
+        // health
+        const score = st.survivalScore;
+        setText(el, '#h-score', `${score}`);
+        el.querySelector('#h-ring').dataset.status = score > 70 ? 'nominal' : score > 40 ? 'warning' : 'critical';
+        el.querySelector('#h-ring-fg').style.strokeDashoffset = 263.9 * (1 - score / 100);
+        el.querySelector('#h-subsys').innerHTML = Object.entries(s).map(([k, sec]) =>
+            `<span class="tag" data-status="${esc(sec.status)}" title="${esc(sec.name)}: ${esc(fmt.level[sec.status])}, ${sec.temperature.toFixed(0)} °C">${esc(SHORT[k] || sec.name)}</span>`).join('');
+
+        // autonomy
+        const pl = app.planner;
+        const sup = st.flight.supervisor;
+        setText(el, '#h-planner', `${pl.status}${sup.battery ? '. Battery override active' : ''}${sup.thermal ? '. Thermal override active' : ''}${st.obc.down ? '. Computer rebooting' : ''}.`);
+        const f = st.flight;
+        const planEl = el.querySelector('#h-plan');
+        if (f.plan) {
+            planEl.innerHTML = `<p class="plan-summary">${esc(f.plan.summary)}</p><ol class="steps">${f.plan.commands.map((cmd, i) => {
+                const state = i < f.stepIndex ? 'done' : i === f.stepIndex ? 'active' : 'queued';
+                const word = state === 'done' ? 'Done' : state === 'active' ? (f.stepPhase === 'align' ? 'Aligning' : f.stepType === 'EXECUTE_BURN' ? `Firing ${Math.round(f.stepFraction * 100)}%` : 'Running') : 'Queued';
+                return `<li data-state="${state}"><span>${esc(describeCommand(cmd))}</span><em>${esc(word)}</em></li>`;
+            }).join('')}</ol>`;
+        } else {
+            const last = f.recent[0];
+            planEl.innerHTML = `<p class="empty">No plan running.${last ? ` Last: ${esc(last.summary.slice(0, 110))} (${esc(last.outcome)}).` : ''}</p>`;
+        }
+
+        // strip
+        const bat = s.batteryBay;
+        setText(el, '#h-bat', `${bat.charge.toFixed(0)}%`);
+        setText(el, '#h-bat-state', bat.currentDraw < -0.02 ? 'charging' : bat.currentDraw > 0.02 ? 'discharging' : 'idle');
+        setText(el, '#h-solar', `${st.power.solarW.toFixed(1)} W`);
+        setText(el, '#h-inc', env.inSunlight ? `${st.attitude.sunIncidenceDeg.toFixed(0)}° off Sun` : 'in shadow');
+        setText(el, '#h-dv', `${st.physics.maxDeltaV_ms.toFixed(1)} m/s`);
+        const fm = el.querySelector('#h-fuel-m');
+        fm.firstElementChild.style.width = `${s.thrusterPod.fuelPercent}%`;
+        fm.dataset.status = st.physics.maxDeltaV_ms < st.physics.reserveDeltaV_ms ? 'critical' : s.thrusterPod.fuelPercent < 20 ? 'warning' : '';
+        setText(el, '#h-fuel', `${s.thrusterPod.fuelMass.toFixed(1)} g left, ${st.physics.reserveDeltaV_ms} m/s kept in reserve`);
+        const worst = st.conjunctions.reduce((a, b) => (!a || b.pc > a.pc ? b : a), null);
+        setText(el, '#h-pc', worst ? worst.pcFormatted : 'None');
+        el.querySelector('#h-pc').style.color = worst && worst.pc >= 1e-4 ? 'var(--critical)' : worst && worst.pc >= 1e-5 ? 'var(--caution)' : '';
+        setText(el, '#h-pc-sub', worst ? `${worst.name}, closest approach in ${fmt.dur(worst.timeToTca_s)}` : 'No debris in the screening window');
+        setText(el, '#h-rad', `${env.radiationLevel.toFixed(3)} mSv/h`);
+        setText(el, '#h-saa', st.sensors.radiationDetector.saaPassingGrade ? 'South Atlantic Anomaly' : '');
+
+        const hist = st.history.slice(-240);
+        drawSparkline(el.querySelector('#sp-bat'), hist.map(h => ({ t: h.t, v: h.soc })), { min: 0, max: 100, format: v => `${v.toFixed(0)}%` });
+        drawSparkline(el.querySelector('#sp-solar'), hist.map(h => ({ t: h.t, v: h.solarW })), { min: 0, color: getComputedStyle(document.documentElement).getPropertyValue('--sun'), format: v => `${v.toFixed(1)} W` });
+        drawSparkline(el.querySelector('#sp-rad'), hist.map(h => ({ t: h.t, v: h.dose })), { min: 0, format: v => `${v.toFixed(3)} mSv/h` });
+    }
+
+    return {
+        element: el,
+        init() {
+            scene = new OrbitScene(el.querySelector('.hero'));
+            const camE = el.querySelector('#cam-earth'), camS = el.querySelector('#cam-sat');
+            camE.addEventListener('click', () => { scene.setFollow(false); camE.setAttribute('aria-pressed', 'true'); camS.setAttribute('aria-pressed', 'false'); });
+            camS.addEventListener('click', () => { scene.setFollow(true); camS.setAttribute('aria-pressed', 'true'); camE.setAttribute('aria-pressed', 'false'); });
+            bindExplainers(el, EXPLAIN);
+            update();
+            renderLog();
+            interval = setInterval(update, 250);
+            unsub = onLog(renderLog);
+        },
+        destroy() {
+            clearInterval(interval);
+            unsub?.();
+            scene?.destroy();
+        },
+    };
 }

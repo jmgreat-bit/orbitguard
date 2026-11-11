@@ -1,11 +1,12 @@
-// Simple hash-based page router
+// Hash router. Builds a view once per navigation (setting the hash used to fire
+// hashchange and build every view twice) and always tears the previous one down.
 
 export class Router {
     constructor(containerId) {
         this.container = document.getElementById(containerId);
         this.routes = {};
+        this.current = null;
         this.currentView = null;
-
         window.addEventListener('hashchange', () => this.navigate());
     }
 
@@ -14,29 +15,25 @@ export class Router {
     }
 
     navigate(hash) {
-        const target = hash || window.location.hash.slice(1) || 'home';
-        window.location.hash = target;
-
-        const factory = this.routes[target];
-        if (!factory) return;
-
-        // Destroy current view
-        if (this.currentView && this.currentView.destroy) {
-            this.currentView.destroy();
+        let target = hash || window.location.hash.slice(1) || 'home';
+        if (!this.routes[target]) target = 'home';
+        if (window.location.hash.slice(1) !== target) {
+            history.replaceState(null, '', `#${target}`);
         }
+        if (target === this.current) return;
+        this.current = target;
 
-        // Clear container & build new view
+        try { this.currentView?.destroy?.(); } catch (e) { console.error('view teardown failed', e); }
         this.container.innerHTML = '';
-        this.currentView = factory();
+        this.currentView = this.routes[target]();
         this.container.appendChild(this.currentView.element);
+        this.currentView.init?.();
+        this.container.scrollTop = 0;
 
-        if (this.currentView.init) {
-            this.currentView.init();
-        }
-
-        // Update nav buttons
         document.querySelectorAll('.nav-btn').forEach(btn => {
-            btn.classList.toggle('active', btn.dataset.page === target);
+            const on = btn.dataset.page === target;
+            btn.classList.toggle('active', on);
+            if (on) btn.setAttribute('aria-current', 'page'); else btn.removeAttribute('aria-current');
         });
     }
 }

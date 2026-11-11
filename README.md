@@ -2,110 +2,98 @@
 
 **An autonomous flight controller for a 1U CubeSat, simulated with real orbital physics.**
 
-A Gemini-powered AI acts as flight director for a satellite in Low Earth Orbit — budgeting power, holding thermal limits, managing comms blackouts, and planning collision-avoidance burns against live debris data. The physics underneath is not hand-waved: J2 perturbation, atmospheric drag, the Tsiolkovsky rocket equation, and Chan's collision-probability method.
-
-> *Add a screenshot or GIF of the mission control dashboard here — it's the fastest way to show what this is.*
+An AI planner (Gemini, or a rule-based autopilot when there is no API key) flies a CubeSat in low Earth orbit: it dodges debris with properly sized avoidance burns, manages power and temperature, recovers from faults, and takes Earth images when it is safe to. A deterministic flight controller executes every plan, and a safety supervisor can veto anything the planner asks for.
 
 ---
 
-## Why it's interesting
-
-Most "AI satellite" demos let the model move the spacecraft directly. This one doesn't. The AI is a **planner**, not an actuator — exactly how real spacecraft autonomy is structured.
+## How decisions are made
 
 ```mermaid
 graph LR
-    A[Gemini Planner<br/>15s loop] -->|JSON command plan| B[FlightController<br/>command queue]
-    B -->|discrete steps| C[Physics Engine<br/>10Hz executor]
-    C -->|telemetry| A
-    B -.->|safety override| C
+    P[Planner<br/>Gemini or autopilot] -->|JSON plan| V[Validator]
+    V -->|clean commands| FC[Flight controller<br/>sim-time step executor]
+    FC --> SAT[Spacecraft simulation]
+    SUP[Safety supervisor] -.->|applies safe config,<br/>vetoes conflicts| FC
+    SAT -->|telemetry| P
+    SAT --> SUP
 ```
 
-The planner emits a structured JSON plan. The `FlightController` queues it, executes it step by step, and holds a **safety override** that can veto or abort a maneuver the physics says is unsafe. Plans carry a `plan_id` so a looping model can't double-execute, and an `EMERGENCY` priority flushes the queue instantly.
+- **The planner** proposes a short plan: attitude, power mode, payload, burns, safe mode, computer reboot. Gemini runs with structured JSON output and is shown the onboard solver's avoidance burn as an option. Without a key, or when a request fails, the autopilot plans instead.
+- **The collision backstop** is the autopilot's avoidance rule, called by the simulation itself every 30 simulated seconds. It does not depend on the planner's wall-clock schedule, so it behaves the same at 1× and 500×. An event whose Pc climbs through 1e-4 as tracking improves raises its own alert (`CONJUNCTION_RED`) and an immediate planning cycle.
+- **The validator** rejects unknown commands and bad parameters, normalises burn vectors and caps burns at 2 m/s. A plan built from telemetry more than 120 simulated seconds old is rejected as stale; at a warp where Gemini's reply would be that late, the autopilot plans routine cycles and Gemini is consulted on alerts with the warp held down.
+- **The flight controller** runs plans on *simulation* time, so behaviour is identical at 1× and 500× warp. It aligns the thruster before every burn and fires for exactly the planned Δv. Every burn is checked against the whole screening list when it is armed and again just before ignition: one that would leave the worst collision probability at or above 1e-4 without lowering it is vetoed, whoever planned it.
+- **The safety supervisor** latches with hysteresis. Battery below 15 % triggers survival mode, Sun-pointing and payload off, held until the battery is back above 30 %. A component past its temperature limit triggers sun-avoid and a CPU throttle. While latched, it vetoes only the commands that would undo the safe state, so an avoidance burn can still fly on a low battery.
 
-That separation means the satellite stays alive even when the AI is wrong, slow, or entirely offline — the flight computer falls back to deterministic rules.
+## The physics
 
----
+| System | Model |
+|---|---|
+| Orbit | Circular orbit with J2 nodal regression, altitude over the WGS-84 ellipsoid, real Earth rotation and Sun position |
+| Drag decay | Exponential atmosphere (Vallado table) scaled by F10.7 and Kp, energy method `dr/dt = −ρ·Cd·(A/m)·v·r`, lifetime integrated to 200 km |
+| Eclipse | Cylindrical Earth shadow against the real Sun direction, so eclipse length follows the beta angle |
+| Attitude | Six pointing modes with 1.5 °/s slews; panel Sun incidence follows from the real geometry |
+| Power | Two 5 W wings, 60 Wh 2S Li-ion pack with an OCV curve, no charging below 0 °C, thermostatic heater, per-load budget |
+| Thermal | Eight radiative/conductive nodes: sunlight, Earth IR, albedo, `εσAT⁴` to space, electronics dissipation |
+| Propulsion | 0.1 N cold gas at Isp 60 s; finite burns integrated with the rocket equation |
+| Collision risk | Conjunction messages (TCA, miss vector, shrinking σ); Pc from **Chan's exact series**; burns shift every upcoming miss via the **Clohessy–Wiltshire** equations |
+| Comms | Ground-station passes with a 5° mask, free-space link budget, data rate and latency |
+| Radiation | LEO background, South Atlantic Anomaly, solar proton events; single-event upsets in the computer |
+| Magnetic field | Tilted dipole (IGRF-14 pole) |
+| Space weather | Live Kp and F10.7 (NOAA SWPC) and flares (NASA DONKI) when reachable; CMEs and proton events on the simulation clock |
 
-## The physics is real
-
-| System | Model | Why it matters |
-|---|---|---|
-| **Orbital decay** | Exponential atmospheric density, NRLMSISE-style banded layers | Altitude actually decays over the mission |
-| **RAAN drift** | J2 perturbation from Earth's oblateness | The orbital plane precesses, like a real LEO orbit |
-| **Fuel burns** | Tsiolkovsky rocket equation | Every burn permanently costs mass — fuel is finite |
-| **Collision risk** | Chan's method, B-plane projection | Debris threat is a probability `Pc`, not a yes/no flag |
-| **Power** | 60 Wh Li-ion, 10 W peak 1U panels | Sourced from AAC Clyde Space CubeSat specs |
-| **Thermal** | −20 °C to +70 °C safe band | Sourced from NASA CubeSat 101 |
-
-Full sourcing in [`REAL_SATELLITE_SPECS.md`](REAL_SATELLITE_SPECS.md).
-
-**Live data**, with mock fallbacks when offline or rate-limited:
-- **CelesTrak** — real TLE orbital elements (ISS as the reference orbit)
-- **NASA DONKI** — real solar flare events, fed through a CME arrival-delay queue
-
----
-
-## Features
-
-- Mission control dashboard with live subsystem telemetry
-- Five views — overview, ship systems, propulsion, space environment, crisis response
-- 3D satellite and LIDAR debris visualization (Three.js)
-- Time acceleration up to 100× to watch multi-orbit behavior
-- Live AI decision log with reasoning for every command
-- Survival score across power, thermal, comms, and orbit health
-- Coronal mass ejection events with realistic propagation delay
-
----
+Every formula is unit-tested: `npm test` runs 86 tests, including a brute-force integral that cross-checks Chan's series and regression tests for each bug fixed in v2. `npm run bench` flies 30 seeded three-day missions per scenario and prints a scorecard (missions lost, red conjunctions left unmitigated, Δv used, lowest battery).
 
 ## Running it
 
 ```bash
 npm install
+cp .env.example .env     # then add GEMINI_API_KEY (optional)
+npm run dev              # http://localhost:5173
+npm test
 ```
 
-Copy the env template and add your key:
+The key stays on the local Vite server (`server/api.js`). The browser asks `/api/plan`, so the key is never in the JavaScript bundle. The same server fetches CelesTrak, NOAA and NASA, which avoids browser CORS limits.
 
-```bash
-cp .env.example .env
-```
+`npm run build` makes a static `dist/`. Served on its own (no Node server) it still runs, with the autopilot planning and simulated space weather. `npm run preview` serves the build *with* the API.
 
-Get a free Gemini API key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) and paste it into `.env`. Then:
+**No key?** The autopilot flies the whole mission. Drills on the *Drills & log* page exercise everything: debris on a collision course, an overheating computer, a battery cell failure, flares, CMEs, a solar wing hit, a radio lock-up and a severe storm.
 
-```bash
-npm run dev
-```
+## The assistant
 
-Opens at `http://localhost:5173`. The satellite begins orbiting immediately.
+The round button at the bottom right opens **Ask OrbitGuard**, a chat that explains the system and anything on screen. Tap **Explain** on an alert or on any log line and it gets the question, the current telemetry, the latest log entries and any browser errors as context. With `GEMINI_API_KEY` set it answers through the server (`POST /api/assist`, one question per second); without a key it answers from a built-in knowledge base (`src/assistant/knowledge.js`) covering the architecture, every override and error code, the data badges and the drills.
 
-**No API key?** It still runs. The flight computer drops to its deterministic safety rules and the AI decision log reports `AI_OFFLINE`.
+## The 3D views
 
----
+- **Overview:** the real Earth (day and night, city lights, clouds) rotating at the true rate and lit by the Sun for the simulated date, with your orbit, ground stations and debris tracks near closest approach.
+- **Satellite:** a 1U CubeSat built to the CubeSat Design Spec envelope, shown in its true attitude over the ground it is flying above. Thermal and x-ray modes, thruster plume, Sun, flight-direction and Earth vectors. **Drop any `.glb` / `.gltf` file** on the view to fly your own model (NASA publishes free ones at science.nasa.gov/3d-resources).
 
 ## Project structure
 
 ```
+server/api.js              Local API: Gemini planner and assistant, CelesTrak, NOAA, NASA
 src/
-├── main.js                  # App orchestrator, physics tick, AI loop
-├── satellite.js             # CubeSat state — power, thermal, comms, sensors
-├── physics.js               # J2, drag, Tsiolkovsky, Chan collision probability
-├── ai-brain.js              # Gemini planner + structured command schema
-├── autonomy/
-│   └── FlightController.js  # Command queue, step executor, safety override
-├── data-service.js          # CelesTrak + NASA DONKI, with mock fallbacks
-├── webgl/                   # Three.js satellite + LIDAR rendering
-├── views/                   # Dashboard screens
-└── ui/                      # Crisis alert system
+├── main.js                Mission director: clock, planner schedule, events
+├── satellite.js           Spacecraft simulation (orbit → attitude → power → thermal → …)
+├── physics.js             Drag, J2, geodetic altitude, rocket equation, CW, Chan Pc
+├── sim/                   geometry, thermal, power, conjunctions, space weather
+├── autonomy/              plan contract, flight controller + supervisor, autopilot, prompt
+├── ai-brain.js            Browser client for /api/plan
+├── assistant/             Knowledge base, live-context builder for the assistant
+├── data-service.js, tle.js, feeds.js
+├── webgl/                 Earth, orbit scene, CubeSat model, satellite close-up
+├── views/, ui/            Pages, alert, modal, helpers
+test/                      physics, flight controller, autonomy safety, services
+scripts/benchmark.mjs      Seeded Monte Carlo scorecard for the autonomy stack
+public/textures/           Earth maps (three.js examples, from NASA imagery)
 ```
 
----
+## Honest limits
 
-## Tech
+It is a teaching simulation, not flight software. The orbit is circular (no SGP4 propagation after initialisation). The atmosphere is an exponential fit, not NRLMSISE. Debris encounters are synthetic, though the object families are real. Thermal and power parameters are representative of a 1U, not a specific spacecraft.
 
-Vite · Vanilla JS (ES modules) · Three.js · satellite.js · Google Gemini 2.5 Flash
+## Credits
 
-Built as a learning project to understand spacecraft autonomy and orbital mechanics from first principles.
-
----
+Earth textures from the three.js examples (MIT), derived from NASA Blue Marble and Black Marble imagery. Atmosphere table from Vallado, *Fundamentals of Astrodynamics and Applications*. Collision probability after Chan (1997, 2008). Operations concept informed by Castano et al., *Operations for Autonomous Spacecraft* (NASA JPL).
 
 ## License
 

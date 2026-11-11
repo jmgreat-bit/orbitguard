@@ -1,302 +1,125 @@
-// CRISIS SIMULATION VIEW — inject failures and test AI response
+// Drills & log — inject failures, choose the planner, watch the controller and the full log.
+import { app } from '../app.js';
+import { MISSION_LOG, onLog } from '../log.js';
+import { esc, fmt, setText, describeCommand } from '../ui/dom.js';
 
-import { AI_LOG, logDecision } from '../ai-brain.js';
-
-const EVENTS = [
-    {
-        id: 'solar_flare',
-        label: 'SOLAR FLARE',
-        desc: 'X-class flare -- radiation spike',
-        color: '#ff8800',
-        apply: (sat) => {
-            sat.environment.radiationLevel = 1.8 + Math.random() * 0.8;
-            sat.environment.geomagneticIndex = 7 + Math.floor(Math.random() * 3);
-            sat.sensors.radiationDetector.saaPassingGrade = true;
-            logDecision({ action: 'EVENT', reason: `X-class solar flare! Radiation: ${sat.environment.radiationLevel.toFixed(1)} mSv/hr, Kp=${sat.environment.geomagneticIndex}`, threat_level: 'critical' });
-        }
-    },
-    {
-        id: 'cme_incoming',
-        label: 'CME INCOMING',
-        desc: 'Coronal mass ejection -- impact in ~30 min',
-        color: '#ff4400',
-        apply: (sat, brain) => {
-            if (brain && brain.queueCME) {
-                brain.queueCME(1800000 + Math.random() * 1800000);
-            } else {
-                sat.environment.radiationLevel = 1.5;
-                sat.environment.geomagneticIndex = 7;
-                logDecision({ action: 'CME_ALERT', reason: 'CME incoming -- radiation elevated', threat_level: 'warning' });
-            }
-        }
-    },
-    {
-        id: 'debris_close',
-        label: 'DEBRIS INTERCEPT',
-        desc: 'Object on collision trajectory',
-        color: '#ff2244',
-        apply: (sat) => {
-            if (sat.sensors.lidar.trackedObjects.length > 0) {
-                sat.sensors.lidar.trackedObjects[0].distance = 8 + Math.random() * 5;
-                logDecision({ action: 'EVENT', reason: `Debris ${sat.sensors.lidar.trackedObjects[0].id} closing to ${sat.sensors.lidar.trackedObjects[0].distance.toFixed(1)}km -- CRITICAL INTERCEPT`, threat_level: 'critical' });
-            }
-        }
-    },
-    {
-        id: 'battery_drain',
-        label: 'BATTERY CRISIS',
-        desc: 'Power cell failure -- rapid drain',
-        color: '#ffdd00',
-        apply: (sat) => {
-            sat.sections.batteryBay.charge = 12 + Math.random() * 5;
-            sat.sections.batteryBay.healthPercent = Math.max(40, sat.sections.batteryBay.healthPercent - 20);
-            sat.sections.batteryBay.status = 'critical';
-            logDecision({ action: 'EVENT', reason: `Battery cell failure! Charge at ${sat.sections.batteryBay.charge.toFixed(0)}%, health degraded`, threat_level: 'critical' });
-        }
-    },
-    {
-        id: 'thermal_runaway',
-        label: 'THERMAL RUNAWAY',
-        desc: 'CPU/reaction wheel overheating',
-        color: '#ff4400',
-        apply: (sat) => {
-            sat.sections.onboardComputer.temperature = 82 + Math.random() * 15;
-            sat.sections.onboardComputer.status = 'critical';
-            sat.sections.onboardComputer.errorCount += 8;
-            sat.sections.thermalRadiator.pumpActive = false;
-            logDecision({ action: 'EVENT', reason: `Thermal runaway! OBC at ${sat.sections.onboardComputer.temperature.toFixed(0)}C, radiator pump failure`, threat_level: 'critical' });
-        }
-    },
-    {
-        id: 'solar_panel_a_fail',
-        label: 'PANEL A FAILURE',
-        desc: 'Micrometeorite impact -- panel A offline',
-        color: '#ffdd00',
-        apply: (sat) => {
-            sat.sections.solarPanelA.deployed = false;
-            sat.sections.solarPanelA.efficiency = 0.1;
-            sat.sections.solarPanelA.powerOutput = 0;
-            sat.sections.solarPanelA.status = 'critical';
-            logDecision({ action: 'EVENT', reason: 'Micrometeorite impact! Solar Panel A offline -- power generation halved', threat_level: 'warning' });
-        }
-    },
-    {
-        id: 'comm_blackout',
-        label: 'COMM BLACKOUT',
-        desc: 'Antenna malfunction -- signal lost',
-        color: '#888888',
-        apply: (sat) => {
-            sat.sections.commArray.linkStatus = 'LOST';
-            sat.sections.commArray.signalStrength = -130;
-            sat.sections.commArray.dataRate = 0;
-            sat.sections.commArray.status = 'critical';
-            logDecision({ action: 'EVENT', reason: 'Comm antenna failure -- complete signal blackout. AI operating autonomously', threat_level: 'warning' });
-        }
-    },
-    {
-        id: 'orbital_decay',
-        label: 'RAPID DECAY',
-        desc: 'Geomagnetic storm inflates atmosphere',
-        color: '#00ccff',
-        apply: (sat) => {
-            sat.orbit.baseAltitude = Math.max(sat.orbit.baseAltitude - 12, 200);
-            sat.environment.geomagneticIndex = 8;
-            logDecision({ action: 'EVENT', reason: `Geomagnetic storm! Altitude dropped to ${sat.orbit.baseAltitude.toFixed(0)}km -- orbital reboost required`, threat_level: 'warning' });
-        }
-    },
-    {
-        id: 'all_clear',
-        label: 'ALL CLEAR',
-        desc: 'Reset all systems to nominal',
-        color: '#00ff88',
-        apply: (sat) => {
-            sat.environment.radiationLevel = 0.12;
-            sat.environment.geomagneticIndex = 3;
-            sat.sections.batteryBay.charge = Math.max(sat.sections.batteryBay.charge, 60);
-            sat.sections.batteryBay.status = 'nominal';
-            sat.sections.onboardComputer.temperature = 45;
-            sat.sections.onboardComputer.errorCount = 0;
-            sat.sections.onboardComputer.status = 'nominal';
-            sat.sections.thermalRadiator.pumpActive = true;
-            sat.sections.commArray.status = 'nominal';
-            Object.values(sat.sections).forEach(s => { if (s.status === 'critical') s.status = 'nominal'; });
-            logDecision({ action: 'EVENT', reason: 'Systems nominal -- anomalies cleared by ground command', threat_level: 'nominal' });
-        }
-    }
+const DRILLS = [
+    { id: 'debris_close', title: 'Debris on a collision course', desc: 'A tracked fragment, closest approach in about an hour, Pc around 1e-3.' },
+    { id: 'thermal_runaway', title: 'Overheating computer', desc: 'A reaction wheel is driven against its brake and the heat strap fails.' },
+    { id: 'battery_drain', title: 'Battery cell failure', desc: 'Charge drops to about 14 % and capacity is reduced.' },
+    { id: 'solar_flare', title: 'X-class solar flare', desc: 'Energetic protons in about 20 min, a CME storm in about 6 h.' },
+    { id: 'cme_incoming', title: 'CME on the way', desc: 'Geomagnetic storm in 30 to 60 min: more drag, more radiation.' },
+    { id: 'solar_panel_a_fail', title: 'Solar wing hit', desc: 'A micrometeoroid cuts wing A to 15 % output.' },
+    { id: 'comm_blackout', title: 'Radio lock-up', desc: 'The transmitter firmware hangs. A computer reboot fixes it.' },
+    { id: 'orbital_decay', title: 'Severe geomagnetic storm', desc: 'Kp 8.3 now: the upper atmosphere swells and drag climbs.' },
+    { id: 'all_clear', title: 'Reset drills', desc: 'Clear injected faults, calm space weather, empty the screening list.' },
 ];
 
-export function createCrisisView(satellite, brain) {
+export function createCrisisView() {
     const el = document.createElement('div');
-    el.className = 'view view-crisis';
+    el.className = 'view panels log-layout';
     el.innerHTML = `
-    <div class="crisis-layout">
-
-      <!-- TOP: Event Injection Buttons -->
-      <div class="eng-card crisis-events-card">
-        <div class="eng-card-header">CRISIS INJECTION -- TEST AI RESPONSE</div>
-        <div class="crisis-subtitle">Inject failure events and watch the AI autonomously respond</div>
-        <div class="crisis-buttons" id="crisis-btns"></div>
+    <section class="surface wide">
+      <div class="block">
+        <div class="block-head"><h2>Drills</h2><span class="block-note">Each one is handled by the planner and the safety supervisor, exactly as in flight.</span></div>
+        <div class="drills">${DRILLS.map(d => `<button class="drill" data-drill="${d.id}"><b>${esc(d.title)}</b><span>${esc(d.desc)}</span></button>`).join('')}</div>
       </div>
+    </section>
 
-      <!-- BOTTOM ROW: Big Log + Threat Panel -->
-      <div class="crisis-bottom-row">
-
-        <!-- LARGE Decision Log -->
-        <div class="eng-card crisis-log-card-big">
-          <div class="crisis-log-header">
-            <span class="crisis-log-title">AUTONOMOUS DECISION LOG</span>
-            <button class="log-expand-btn" id="cr-expand-btn">EXPAND FULL LOG</button>
-          </div>
-          <div class="crisis-log-big" id="crisis-log"></div>
+    <section class="surface">
+      <div class="block">
+        <div class="block-head"><h2>Planner</h2></div>
+        <p class="planner-line" id="pl-status">—</p>
+        <div class="seg" role="group" aria-label="Who plans">
+          <button class="btn" data-mode="auto">Gemini when available</button>
+          <button class="btn" data-mode="autopilot">Autopilot only</button>
         </div>
-
-        <!-- Threat Assessment Panel -->
-        <div class="eng-card crisis-gauge-card">
-          <div class="eng-card-header">THREAT ASSESSMENT</div>
-          <div class="threat-display">
-            <div class="threat-level-big" id="cr-threat">NOMINAL</div>
-            <div class="threat-bars" id="cr-threat-bars"></div>
-          </div>
-          <div class="cr-stats">
-            <div class="cr-stat-row"><span>Altitude</span><span id="cr-alt">--</span></div>
-            <div class="cr-stat-row"><span>Dv Remaining</span><span id="cr-dv">--</span></div>
-            <div class="cr-stat-row"><span>Closest Debris Pc</span><span id="cr-pc">--</span></div>
-            <div class="cr-stat-row"><span>Radiation</span><span id="cr-rad">--</span></div>
-            <div class="cr-stat-row"><span>Battery</span><span id="cr-bat">--</span></div>
-            <div class="cr-stat-row cr-stat-score"><span>Survival Score</span><span id="cr-score">--</span></div>
-          </div>
-          <div class="crisis-forecast" id="cr-forecast">Awaiting AI assessment...</div>
+        <div style="margin-top:10px"><button class="btn btn-primary" id="pl-now">Plan now</button></div>
+        <div class="rows" style="margin-top:12px">
+          <div class="row"><span>Last decision</span><span id="pl-last">—</span></div>
+          <div class="row"><span>Battery override</span><span id="sup-bat">—</span></div>
+          <div class="row"><span>Thermal override</span><span id="sup-th">—</span></div>
         </div>
-
       </div>
-    </div>
-
-    <!-- FULLSCREEN LOG OVERLAY -->
-    <div class="log-overlay" id="log-overlay">
-      <div class="log-overlay-panel">
-        <div class="log-overlay-header">
-          <span class="log-overlay-title">FULL MISSION LOG</span>
-          <button class="log-close-btn" id="cr-close-btn">X  CLOSE</button>
-        </div>
-        <div class="log-overlay-entries" id="log-overlay-entries"></div>
+      <div class="block">
+        <div class="block-head"><h3>Flight controller</h3></div>
+        <div id="fc-now"></div>
+        <div class="block-head" style="margin-top:12px"><h3>Queued</h3></div>
+        <div class="rows" id="fc-queue"></div>
+        <div class="block-head" style="margin-top:12px"><h3>Finished</h3></div>
+        <div class="rows" id="fc-recent"></div>
       </div>
-    </div>
-  `;
+    </section>
 
-    // Build event buttons
-    const btns = el.querySelector('#crisis-btns');
-    EVENTS.forEach(ev => {
-        const btn = document.createElement('button');
-        btn.className = 'crisis-btn';
-        btn.style.setProperty('--ev-color', ev.color);
-        btn.innerHTML = `<span class="cb-label">${ev.label}</span><span class="cb-desc">${ev.desc}</span>`;
-        btn.addEventListener('click', () => {
-            ev.apply(satellite, brain);
-            btn.classList.add('cb-flash');
-            setTimeout(() => btn.classList.remove('cb-flash'), 600);
-        });
-        btns.appendChild(btn);
+    <section class="surface">
+      <div class="block">
+        <div class="block-head"><h2>Mission log</h2>
+          <div class="filters seg" role="group" aria-label="Filter">
+            <button class="btn" data-filter="all" aria-pressed="true">All</button>
+            <button class="btn" data-filter="warn" aria-pressed="false">Warnings</button>
+            <button class="btn" data-filter="critical" aria-pressed="false">Critical</button>
+          </div>
+        </div>
+        <ul class="log log-full" id="log-full"></ul>
+      </div>
+    </section>`;
+
+    let interval, unsub, filter = 'all', shown = [];
+    el.querySelector('#log-full').addEventListener('click', (ev) => {
+        const b = ev.target.closest('.log-explain');
+        if (b && shown[Number(b.dataset.i)]) window.dispatchEvent(new CustomEvent('orbitguard:explain-entry', { detail: shown[Number(b.dataset.i)] }));
     });
 
-    // Overlay open / close
-    el.querySelector('#cr-expand-btn').addEventListener('click', () => {
-        el.querySelector('#log-overlay').classList.add('overlay-open');
-        renderOverlayLog(el);
-    });
-    el.querySelector('#cr-close-btn').addEventListener('click', () => {
-        el.querySelector('#log-overlay').classList.remove('overlay-open');
-    });
-    el.querySelector('#log-overlay').addEventListener('click', (e) => {
-        if (e.target === el.querySelector('#log-overlay')) {
-            el.querySelector('#log-overlay').classList.remove('overlay-open');
-        }
-    });
+    function renderLog() {
+        const keep = filter === 'all' ? () => true : filter === 'critical' ? e => e.level === 'critical' : e => e.level !== 'nominal';
+        shown = MISSION_LOG.filter(keep).slice(0, 120);
+        el.querySelector('#log-full').innerHTML = shown.map((e, i) => `
+          <li data-level="${esc(e.level)}">
+            <div class="log-head"><span class="log-action">${esc(e.action)}</span><span class="log-meta">${esc(fmt.clock(e.missionTime))}, ${esc(e.source)}</span><button class="log-explain" data-i="${i}" aria-label="Explain ${esc(e.action)}">Explain</button></div>
+            <div class="log-reason">${esc(e.reason)}</div>
+          </li>`).join('') || '<li class="empty">No entries for this filter.</li>';
+    }
 
-    const escHandler = (e) => {
-        if (e.key === 'Escape') el.querySelector('#log-overlay')?.classList.remove('overlay-open');
-    };
-    window.addEventListener('keydown', escHandler);
+    function update() {
+        const st = app.sat.getFullState();
+        const pl = app.planner;
+        setText(el, '#pl-status', pl.status);
+        el.querySelectorAll('[data-mode]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.mode === pl.mode)));
+        setText(el, '#pl-last', pl.lastDecisionAt ? `${Math.round((Date.now() - pl.lastDecisionAt) / 1000)} s ago by ${pl.using}` : '—');
+        const sup = st.flight.supervisor;
+        setText(el, '#sup-bat', sup.battery ? 'Active' : 'Off').className = sup.battery ? 'status-word' : '';
+        el.querySelector('#sup-bat').dataset.status = sup.battery ? 'critical' : '';
+        setText(el, '#sup-th', sup.thermal ? 'Active' : 'Off').dataset.status = sup.thermal ? 'critical' : '';
+        el.querySelector('#sup-th').className = sup.thermal ? 'status-word' : '';
 
-    let interval = null;
+        const f = st.flight;
+        el.querySelector('#fc-now').innerHTML = f.paused ? '<p class="empty">Computer rebooting, nothing executes.</p>'
+            : f.plan ? `<p class="plan-summary"><b>${esc(f.plan.priority.toLowerCase())}</b> from ${esc(f.plan.source)}: ${esc(f.plan.summary)}</p>
+              <ol class="steps">${f.plan.commands.map((c, i) => `<li data-state="${i < f.stepIndex ? 'done' : i === f.stepIndex ? 'active' : 'queued'}"><span>${esc(describeCommand(c))}</span><em>${i < f.stepIndex ? 'Done' : i === f.stepIndex ? (f.stepPhase === 'align' ? 'Aligning' : 'Running') : 'Queued'}</em></li>`).join('')}</ol>`
+                : '<p class="empty">Idle.</p>';
+        el.querySelector('#fc-queue').innerHTML = f.queue.length ? f.queue.map(q => `<div class="row"><span>${esc(q.summary.slice(0, 80))}</span><span>${esc(q.priority.toLowerCase())}</span></div>`).join('') : '<p class="empty">Empty.</p>';
+        el.querySelector('#fc-recent').innerHTML = f.recent.length ? f.recent.slice(0, 5).map(r => `<div class="row"><span>${esc(r.summary.slice(0, 80))}</span><span class="status-word" data-status="${r.outcome === 'completed' ? 'nominal' : 'warning'}">${esc(r.outcome)}${r.reason ? `: ${esc(r.reason)}` : ''}</span></div>`).join('') : '<p class="empty">Nothing yet.</p>';
+    }
 
     return {
         element: el,
         init() {
-            interval = setInterval(() => this.update(), 500);
-            this.update();
-            this._renderLog();
-            window.addEventListener('ai-decision', () => {
-                this._renderLog();
-                if (el.querySelector('#log-overlay').classList.contains('overlay-open')) {
-                    renderOverlayLog(el);
-                }
-            });
+            el.querySelectorAll('[data-drill]').forEach(b => b.addEventListener('click', () => {
+                app.injectDrill(b.dataset.drill);
+                b.dataset.flash = 'true';
+                setTimeout(() => { b.dataset.flash = 'false'; }, 700);
+            }));
+            el.querySelectorAll('[data-mode]').forEach(b => b.addEventListener('click', () => { app.planner.mode = b.dataset.mode; app.planner.status = b.dataset.mode === 'autopilot' ? 'Autopilot only (Gemini switched off here)' : app.planner.online ? `Gemini (${app.planner.model}) ready` : app.planner.status; update(); }));
+            el.querySelector('#pl-now').addEventListener('click', () => app.requestDecision('operator'));
+            el.querySelectorAll('[data-filter]').forEach(b => b.addEventListener('click', () => {
+                filter = b.dataset.filter;
+                el.querySelectorAll('[data-filter]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+                renderLog();
+            }));
+            update(); renderLog();
+            interval = setInterval(update, 500);
+            unsub = onLog(renderLog); // removed on destroy (the old view leaked this listener)
         },
-        update() {
-            const state = satellite.getFullState();
-            const env = state.environment;
-            const phys = state.physics || {};
-            const nearest = state.sensors.lidar.nearestObject;
-
-            const threat = satellite._lastThreat || 'nominal';
-            const threatColors = { nominal: '#00ccff', caution: '#00ff88', warning: '#ffdd00', critical: '#ff2244' };
-
-            const threatEl = el.querySelector('#cr-threat');
-            if (threatEl) {
-                threatEl.textContent = threat.toUpperCase();
-                threatEl.style.color = threatColors[threat] || '#00ccff';
-            }
-
-            const barsEl = el.querySelector('#cr-threat-bars');
-            if (barsEl) {
-                const barCount = 8;
-                const threatIdx = ['nominal', 'caution', 'warning', 'critical'].indexOf(threat);
-                const fillCount = Math.round((threatIdx / 3) * barCount);
-                barsEl.innerHTML = Array.from({ length: barCount }, (_, i) => {
-                    const active = i < fillCount;
-                    const color = i < 2 ? '#00ff88' : i < 5 ? '#ffdd00' : '#ff2244';
-                    return `<div class="tb-bar" style="background:${active ? color : 'rgba(255,255,255,0.08)'}"></div>`;
-                }).join('');
-            }
-
-            const set = (id, text) => { const e = el.querySelector(`#${id}`); if (e) e.textContent = text; };
-            set('cr-alt', `${env.altitude.toFixed(1)} km`);
-            set('cr-dv', `${phys.maxDeltaV_ms?.toFixed(1) ?? '?'} m/s`);
-            set('cr-pc', nearest.pcFormatted || '< 1e-9');
-            set('cr-rad', `${env.radiationLevel.toFixed(2)} mSv/hr`);
-            set('cr-bat', `${state.sections.batteryBay.charge.toFixed(0)}%`);
-            set('cr-score', `${state.survivalScore}%`);
-            if (satellite._lastForecast) set('cr-forecast', satellite._lastForecast);
-        },
-        _renderLog() { renderInlineLog(el); },
-        destroy() {
-            if (interval) clearInterval(interval);
-            window.removeEventListener('keydown', escHandler);
-        }
+        destroy() { clearInterval(interval); unsub?.(); },
     };
-}
-
-// ── Shared log entry renderer ──────────────────────────────────────────────
-function entryHTML(entry, big = false) {
-    const colors = { nominal: '#00ccff', caution: '#00ff88', warning: '#ffdd00', critical: '#ff2244' };
-    const color = colors[entry.threat_level] || '#888888';
-    const time = new Date(entry.timestamp).toLocaleTimeString();
-    const cls = big ? 'log-entry-big' : 'log-entry';
-    return `<div class="${cls}" style="border-left:3px solid ${color}">
-      <span class="log-time">${time}</span>
-      <span class="log-action" style="color:${color}"> > ${entry.action}</span>
-      <span class="log-reason">${entry.reason}</span>
-    </div>`;
-}
-
-function renderInlineLog(el) {
-    const logEl = el.querySelector('#crisis-log');
-    if (!logEl) return;
-    logEl.innerHTML = (window.__AI_LOG || []).slice(0, 10).map(e => entryHTML(e)).join('');
-}
-
-function renderOverlayLog(el) {
-    const logEl = el.querySelector('#log-overlay-entries');
-    if (!logEl) return;
-    logEl.innerHTML = (window.__AI_LOG || []).map(e => entryHTML(e, true)).join('');
 }

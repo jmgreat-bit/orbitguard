@@ -1,354 +1,221 @@
-import { Lidar3D } from '../webgl/Lidar3D.js';
+// Space environment — conjunction screening with the B-plane picture, space weather,
+// radiation, the geomagnetic field and the radio link.
+import { app } from '../app.js';
+import { meanMotion } from '../physics.js';
+import { esc, fmt, setText, drawSparkline } from '../ui/dom.js';
+import { bindExplainers } from '../ui/modal.js';
 
-export function createSpaceView(satellite) {
-  const el = document.createElement('div');
-  el.className = 'view view-space';
-  el.innerHTML = `
-    <div class="space-grid">
-      <!-- LIDAR -->
-      <div class="eng-card lidar-card" id="card-lidar">
-        <div class="eng-card-header">
-          <span>LIDAR PROXIMITY SCAN</span>
-          <div class="card-btn-group">
-            <button class="btn-icon" id="btn-info-lidar" title="What is this?">?</button>
-            <button class="btn-icon" id="btn-exp-lidar" title="Expand View">↗</button>
-          </div>
-        </div>
-        <div class="lidar-scope-lg" id="lidar-3d-wrap" style="position:relative; width:100%; height:280px; overflow:hidden;">
-          <!-- 3D Canvas injected here -->
-        </div>
-        <!-- Tracked objects list -->
-        <div class="tracked-list" id="sp-tracked">
-        </div>
-      </div>
-
-      <!-- B-Plane Collision Analysis (New Math Feature) -->
-      <div class="eng-card bplane-card" id="card-bplane" style="grid-column: 1 / -1; margin-bottom: 20px;">
-        <div class="eng-card-header">
-          <span>B-PLANE COLLISION PROBABILITY (CHAN)</span>
-          <div class="card-btn-group">
-            <button class="btn-icon" id="btn-info-bplane" title="What is this?">?</button>
-            <button class="btn-icon" id="btn-exp-bplane" title="Expand View">↗</button>
-          </div>
-        </div>
-        <div class="eng-details" style="display:grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start;">
-          <div>
-            <div class="ed-row"><span>Target Object</span><span id="sp-bp-target">—</span></div>
-            <div class="ed-row"><span>Miss Distance (d)</span><span id="sp-bp-miss">—</span></div>
-            <div class="ed-row"><span>Relative Velocity (v)</span><span id="sp-bp-vel">—</span></div>
-            <div class="ed-row">
-              <span style="border-bottom:1px dashed var(--text-dim)" title="1-sigma uncertainty disk radius">Positional Covariance (σ)</span>
-              <span id="sp-bp-sigma">—</span>
-            </div>
-            <div class="ed-row">
-              <span style="border-bottom:1px dashed var(--text-dim)" title="Combined radius of satellite + debris">Hard-body Radius (R)</span>
-              <span id="sp-bp-radius">—</span>
-            </div>
-            <div class="ed-row" style="border-top:1px solid rgba(0,255,255,0.15);padding-top:8px;margin-top:8px">
-              <span>Collision Risk (Pc)</span>
-              <span id="sp-bp-pc" style="font-weight:700;font-size:16px">—</span>
-            </div>
-          </div>
-          <div>
-            <div style="font-size:11px; color:var(--text-dim); margin-bottom:8px; letter-spacing:1px; line-height:1.4">
-              <span style="color:var(--cyan)">MATHEMATICAL MODEL</span><br/>
-              <i>Pc ≈ Q1(d/σ, R/σ)</i> where Q1 is the Marcum Q-function.<br/><br/>
-              The probability represents the 2D Gaussian integral over a disk of radius R, centered at miss distance d on the B-plane.
-            </div>
-            <div class="bplane-viz" style="height:60px; border:1px solid rgba(0,255,255,0.1); border-radius:3px; position:relative; overflow:hidden; background:rgba(0,0,0,0.5)">
-              <div id="sp-bp-sat" style="position:absolute; top:28px; left:10%; width:4px; height:4px; background:var(--cyan); border-radius:50%;"></div>
-              <div id="sp-bp-deb" style="position:absolute; top:28px; left:90%; width:4px; height:4px; background:var(--red); border-radius:50%; box-shadow:0 0 10px var(--red)"></div>
-              <div id="sp-bp-cov" style="position:absolute; top:28px; left:10%; width:40px; height:40px; border:1px dashed var(--cyan); border-radius:50%; transform:translate(-50%, -50%); opacity:0.3"></div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Radiation -->
-      <div class="eng-card" id="card-rad">
-        <div class="eng-card-header">
-          <span>RADIATION MONITOR</span>
-          <div class="card-btn-group">
-            <button class="btn-icon" id="btn-info-rad" title="What is this?">?</button>
-            <button class="btn-icon" id="btn-exp-rad" title="Expand View">↗</button>
-          </div>
-        </div>
-        <div class="rad-display">
-          <div class="rad-current">
-            <div class="rad-big" id="sp-rad-rate">0.15</div>
-            <div class="rad-unit">mSv/hr</div>
-          </div>
-          <div class="rad-bar-wrap">
-            <div class="rad-bar" id="sp-rad-bar"></div>
-            <div class="rad-threshold">ALERT: 1.0</div>
-          </div>
-        </div>
-        <div class="eng-details">
-          <div class="ed-row"><span>Cumulative Dose</span><span id="sp-rad-cum">427 mSv</span></div>
-          <div class="ed-row"><span>SAA Status</span><span id="sp-rad-saa">CLEAR</span></div>
-          <div class="ed-row"><span>Alert Threshold</span><span>1.0 mSv/hr</span></div>
-          <div class="ed-row"><span>Solar Flux</span><span id="sp-solar-flux">120 SFU</span></div>
-          <div class="ed-row"><span>Geomagnetic Kp</span><span id="sp-kp">3</span></div>
-        </div>
-      </div>
-
-      <!-- Magnetic Field -->
-      <div class="eng-card" id="card-mag">
-        <div class="eng-card-header">
-          <span>MAGNETOMETER</span>
-          <div class="card-btn-group">
-            <button class="btn-icon" id="btn-info-mag" title="What is this?">?</button>
-            <button class="btn-icon" id="btn-exp-mag" title="Expand View">↗</button>
-          </div>
-        </div>
-        <div class="mag-display">
-          <div class="mag-big" id="sp-mag-str">35000</div>
-          <div class="mag-unit">nT</div>
-        </div>
-        <div class="eng-details">
-          <div class="ed-row"><span>Field X</span><span id="sp-mag-x">0.30</span></div>
-          <div class="ed-row"><span>Field Y</span><span id="sp-mag-y">0.80</span></div>
-          <div class="ed-row"><span>Field Z</span><span id="sp-mag-z">0.50</span></div>
-          <div class="ed-row"><span>Declination</span><span id="sp-mag-dec">12°</span></div>
-          <div class="ed-row"><span>Anomaly</span><span id="sp-mag-anom">NONE</span></div>
-        </div>
-      </div>
-
-      <!-- Communications -->
-      <div class="eng-card" id="card-comm">
-        <div class="eng-card-header">
-          <span>COMMUNICATION LINK</span>
-          <div class="card-btn-group">
-            <button class="btn-icon" id="btn-info-comm" title="What is this?">?</button>
-            <button class="btn-icon" id="btn-exp-comm" title="Expand View">↗</button>
-          </div>
-        </div>
-        <div class="comm-status-big" id="sp-comm-status">WEAK</div>
-        <div class="eng-details">
-          <div class="ed-row"><span>Frequency</span><span id="sp-comm-freq">435.0 MHz</span></div>
-          <div class="ed-row"><span>TX Power</span><span id="sp-comm-tx">1.0W</span></div>
-          <div class="ed-row"><span>Signal Strength</span><span id="sp-comm-sig">-95 dBm</span></div>
-          <div class="ed-row" style="border-bottom:1px dashed var(--cyan-dim)" title="One-way Speed of Light + Hardware Delay">
-            <span>Latency (Ping)</span><span id="sp-comm-ping">15 ms</span>
-          </div>
-          <div class="ed-row"><span>Data Rate</span><span id="sp-comm-rate">4800 bps</span></div>
-          <div class="ed-row"><span>Antenna Temp</span><span id="sp-comm-temp">28°C</span></div>
-          <div class="ed-row"><span>Last Contact</span><span id="sp-comm-last">—</span></div>
-          <div class="ed-row"><span>Next Pass</span><span id="sp-comm-next">12 min</span></div>
-        </div>
-      </div>
-    </div>
-  `;
-
-  let interval = null;
-
-  return {
-    element: el,
-    init() {
-      const lidarContainer = el.querySelector('#lidar-3d-wrap');
-      this.lidar3D = new Lidar3D(lidarContainer, 200); // 200km max range
-
-      interval = setInterval(() => this.update(), 500);
-      this.update();
-
-      // Modal Hooks
-      import('../main.js').then(({ showModal }) => {
-        const bplaneInfo = `
-          <p><strong>B-Plane Collision Geometry (Chan's Model)</strong></p>
-          <p>This panel visualizes the mathematical foundation used to calculate the risk of colliding with space debris.</p>
-          <p><strong>Definitions:</strong></p>
-          <ul>
-            <li><strong>Miss Distance ($d$):</strong> The closest point of approach (CPA) between our satellite and the debris object.</li>
-            <li><strong>Hard-body Radius ($R$):</strong> The combined physical size of both objects (if their centers come closer than this, they hit).</li>
-            <li><strong>Positional Covariance ($\\sigma$):</strong> The 1-sigma uncertainty in the radar/tracking data. The exact position is a Gaussian distribution, not a single point.</li>
-          </ul>
-          <p><strong>The Math:</strong></p>
-          <p>We use Chan's method, assuming a spherical, isotropic covariance matrix. The collision probability ($P_c$) is computed by integrating the 2D Gaussian probability density function over a disk of radius $R$ centered at the miss distance $d$ on the Encounter Plane (B-Plane).</p>
-        `;
-
-        document.getElementById('btn-info-bplane')?.addEventListener('click', () => {
-          showModal('CHAN COLLISION PROBABILITY', bplaneInfo, false);
-        });
-
-        document.getElementById('btn-exp-bplane')?.addEventListener('click', () => {
-          const cardHtml = document.getElementById('card-bplane').innerHTML;
-          showModal('CHAN COLLISION PROBABILITY', `<div class="expanded-card-view">${cardHtml}</div>`, true);
-        });
-
-        // LIDAR Hook
-        const lidarInfo = `
-          <p><strong>LIDAR Sweeper Array</strong></p>
-          <p>An active scanning system tracking nearby micrometeoroids and space debris within a 200km radius.</p>
-          <p>It reports the physical distance and relative velocity of tracked objects. Not all objects pose a collision threat, but highly energetic ones trigger automatic AI evasion responses.</p>
-        `;
-        document.getElementById('btn-info-lidar')?.addEventListener('click', () => { showModal('LIDAR PROXIMITY SCAN', lidarInfo, false); });
-        document.getElementById('btn-exp-lidar')?.addEventListener('click', () => {
-          showModal('LIDAR PROXIMITY SCAN', `<div class="expanded-card-view">${document.getElementById('card-lidar').innerHTML}</div>`, true);
-        });
-
-        // RADIATION Hook
-        const radInfo = `
-          <p><strong>Geiger-Muller Tube Array</strong></p>
-          <p>Measures high-energy ionizing radiation from solar flares, coronal mass ejections (CMEs), and the South Atlantic Anomaly (SAA).</p>
-          <p>Dose rates above 1.0 mSv/hr degrade the satellite's solar panel efficiency and increase processing errors (bit-flips) in the Onboard Computer.</p>
-        `;
-        document.getElementById('btn-info-rad')?.addEventListener('click', () => { showModal('RADIATION MONITOR', radInfo, false); });
-        document.getElementById('btn-exp-rad')?.addEventListener('click', () => {
-          showModal('RADIATION MONITOR', `<div class="expanded-card-view">${document.getElementById('card-rad').innerHTML}</div>`, true);
-        });
-
-        // MAGNETOMETER Hook
-        const magInfo = `
-          <p><strong>Fluxgate Magnetometer</strong></p>
-          <p>Measures the strength and vector of Earth's local magnetic field (in nanoTeslas).</p>
-          <p>Used by the onboard AI to modulate the magnetic torque rods for attitude control without wasting thruster fuel. Major solar storms disrupt this field, causing navigational anomalies.</p>
-        `;
-        document.getElementById('btn-info-mag')?.addEventListener('click', () => { showModal('MAGNETOMETER', magInfo, false); });
-        document.getElementById('btn-exp-mag')?.addEventListener('click', () => {
-          showModal('MAGNETOMETER', `<div class="expanded-card-view">${document.getElementById('card-mag').innerHTML}</div>`, true);
-        });
-
-        // COMM Hook
-        const commInfo = `
-          <p><strong>Phased Array Transceiver</strong></p>
-          <p>Maintains the uplink/downlink to ground control. Signal strength dictates the data rate.</p>
-          <p>If the link drops below -105 dBm or the satellite passes over a blind spot, all systems switch to fully autonomous execution via the Gemini 2.0 AI Brain until contact is re-established.</p>
-        `;
-        document.getElementById('btn-info-comm')?.addEventListener('click', () => { showModal('COMMUNICATION LINK', commInfo, false); });
-        document.getElementById('btn-exp-comm')?.addEventListener('click', () => {
-          showModal('COMMUNICATION LINK', `<div class="expanded-card-view">${document.getElementById('card-comm').innerHTML}</div>`, true);
-        });
-      });
+const EXPLAIN = {
+    conj: {
+        title: 'Conjunction screening',
+        html: `<p>A 1U CubeSat cannot see debris itself. Ground tracking networks predict close approaches and send <strong>conjunction data messages</strong>: the time of closest approach (TCA), the predicted miss distance and how uncertain the positions are (σ).</p>
+        <p>The uncertainty shrinks as TCA gets closer and tracking improves, so the collision probability (Pc) often rises, then falls. NASA's practice is to consider a manoeuvre when <strong>Pc ≥ 1e-4</strong>. Object names are from real debris clouds. The individual encounters are simulated.</p>`,
     },
-    update() {
-      const state = satellite.getFullState();
-      const lidar = state.sensors.lidar;
-      const rad = state.sensors.radiationDetector;
-      const mag = state.sensors.magnetometer;
-      const comm = state.sections.commArray;
-      const env = state.environment;
-
-      // 3D LIDAR Update
-      if (this.lidar3D) {
-        this.lidar3D.update(lidar.trackedObjects);
-      }
-
-      // Tracked list — now shows Chan collision probability
-      const tracked = document.getElementById('sp-tracked');
-      if (tracked) {
-        tracked.innerHTML = lidar.trackedObjects.map(obj => {
-          const color = obj.riskColor || 'var(--cyan)';
-          const label = obj.riskLabel || '—';
-          const pcStr = obj.pcFormatted || '—';
-          return `<div class="tracked-row">
-            <span class="tr-dot" style="background:${color}"></span>
-            <span class="tr-id">${obj.id}</span>
-            <span class="tr-dist">${obj.distance.toFixed(1)} km</span>
-            <span class="tr-ang" style="color:var(--text-dim);font-family:monospace;font-size:0.7em;min-width:70px">Az ${Math.round(obj.bearing)}° El ${Math.round(obj.elevation || 0)}°</span>
-            <span class="tr-pc" style="color:${color};font-family:monospace;font-size:0.75em">Pc ${pcStr}</span>
-            <span class="tr-risk" style="color:${color};font-size:0.7em">${label}</span>
-          </div>`;
-        }).join('');
-      }
-
-      // B-Plane Analysis (Nearest Object)
-      const nearest = lidar.nearestObject;
-      if (nearest) {
-        setText('sp-bp-target', nearest.id);
-        setText('sp-bp-miss', `${(nearest.distance * 1000).toFixed(0)} m`);
-        setText('sp-bp-vel', `${(nearest.closingSpeed * 1000).toFixed(0)} m / s`);
-
-        const phys = state.physics || {};
-        const sigma = phys.posUncertainty_m || 500;
-        const radius = phys.collisionRadius_m || 10;
-
-        setText('sp-bp-sigma', `${sigma} m`);
-        setText('sp-bp-radius', `${radius} m`);
-
-        const pcEl = document.getElementById('sp-bp-pc');
-        if (pcEl) {
-          pcEl.textContent = nearest.pcFormatted || '< 1e-9';
-          pcEl.style.color = nearest.riskColor || 'var(--cyan)';
-        }
-
-        // Update mini B-plane viz
-        const sat = document.getElementById('sp-bp-sat');
-        const deb = document.getElementById('sp-bp-deb');
-        const cov = document.getElementById('sp-bp-cov');
-
-        if (sat && deb && cov) {
-          // Mapping max distance 100km to pixels.
-          // 10% is sat, up to 90% is debris.
-          const maxDist = 100;
-          const distPct = Math.min((nearest.distance / maxDist) * 80, 80);
-          deb.style.left = `${10 + distPct} % `;
-          deb.style.background = nearest.riskColor || 'var(--red)';
-          deb.style.boxShadow = `0 0 10px ${nearest.riskColor || 'var(--red)'}`;
-        }
-      }
-
-      // Radiation
-      setText('sp-rad-rate', rad.currentDose.toFixed(2));
-      setText('sp-rad-cum', `${rad.cumulativeDose.toFixed(0)} mSv`);
-      const radBar = document.getElementById('sp-rad-bar');
-      if (radBar) {
-        const pct = Math.min((rad.currentDose / rad.alertThreshold) * 100, 100);
-        radBar.style.width = `${pct} % `;
-        radBar.style.background = pct > 80 ? 'var(--red)' : pct > 50 ? 'var(--amber)' : 'var(--green)';
-      }
-      const rateEl = document.getElementById('sp-rad-rate');
-      if (rateEl) rateEl.style.color = rad.currentDose > 0.5 ? 'var(--red)' : 'var(--cyan)';
-
-      const saaEl = document.getElementById('sp-rad-saa');
-      if (saaEl) {
-        saaEl.textContent = rad.saaPassingGrade ? '⚠ IN SAA' : 'CLEAR';
-        saaEl.style.color = rad.saaPassingGrade ? 'var(--red)' : 'var(--green)';
-      }
-      setText('sp-solar-flux', `${env.solarFluxIndex} SFU`);
-      setText('sp-kp', env.geomagneticIndex);
-
-      // Magnetometer
-      setText('sp-mag-str', Math.round(mag.fieldStrength));
-      setText('sp-mag-x', mag.fieldDirection.x.toFixed(2));
-      setText('sp-mag-y', mag.fieldDirection.y.toFixed(2));
-      setText('sp-mag-z', mag.fieldDirection.z.toFixed(2));
-      setText('sp-mag-dec', `${env.magneticDeclination}°`);
-      const anomEl = document.getElementById('sp-mag-anom');
-      if (anomEl) {
-        anomEl.textContent = mag.anomalyDetected ? '⚠ DETECTED' : 'NONE';
-        anomEl.style.color = mag.anomalyDetected ? 'var(--red)' : 'var(--green)';
-      }
-
-      // Communications
-      const commSt = document.getElementById('sp-comm-status');
-      if (commSt) {
-        commSt.textContent = comm.linkStatus;
-        commSt.style.color = comm.linkStatus === 'STRONG' ? 'var(--green)' :
-          comm.linkStatus === 'WEAK' ? 'var(--amber)' : 'var(--red)';
-      }
-      setText('sp-comm-freq', `${comm.frequency} MHz`);
-      setText('sp-comm-tx', `${comm.txPower.toFixed(1)}W`);
-      setText('sp-comm-sig', `${comm.signalStrength.toFixed(0)} dBm`);
-      setText('sp-comm-ping', comm.signalLatency_ms ? `${comm.signalLatency_ms.toFixed(1)} ms` : '—');
-      setText('sp-comm-rate', `${comm.dataRate} bps`);
-      setText('sp-comm-temp', `${comm.temperature.toFixed(0)}°C`);
-      setText('sp-comm-last', comm.lastContact ? timeSince(comm.lastContact) : '—');
-      setText('sp-comm-next', `${state.orbit.timeToNextContact.toFixed(0)} min`);
+    bplane: {
+        title: 'The B-plane',
+        html: `<p>The plane through the satellite at right angles to the debris' relative velocity. Everything that matters for a hit happens in this plane: the <strong>miss vector</strong> (where the debris is predicted to cross), the <strong>uncertainty circles</strong> (1σ and 3σ) and the combined <strong>hard-body radius</strong> of both objects (10 m).</p>
+        <p>Pc is the share of the Gaussian uncertainty that falls inside the hard-body circle, computed with Chan's exact series for a circular covariance (equal to 1 − Q₁(d/σ, R/σ), the Marcum Q-function).</p>
+        <p>A burn moves the satellite: up or down (vertical axis) and along its orbit, which shows up on the horizontal axis depending on the crossing angle. For a head-on pass, only the vertical shift helps.</p>`,
     },
-    destroy() {
-      if (interval) clearInterval(interval);
-      if (this.lidar3D) this.lidar3D.destroy();
+    weather: {
+        title: 'Space weather',
+        html: `<p><strong>Kp</strong> (0 to 9) measures geomagnetic disturbance. Storms heat the upper atmosphere and raise drag. <strong>F10.7</strong> is the Sun's radio flux, a proxy for the ultraviolet that inflates the thermosphere.</p>
+        <p>Solar flares can send energetic protons (arriving within an hour or two) and coronal mass ejections (one to three days later). Live values come from NOAA SWPC and NASA DONKI when the local server can reach them. Otherwise the simulation uses calm defaults and says so.</p>
+        <p>Dose rate rises over the South Atlantic Anomaly, where the inner radiation belt dips lowest.</p>`,
+    },
+};
+
+const badge = (src) => `<span class="tag" data-status="${src && src.startsWith('LIVE') ? 'live' : ''}">${src && src.startsWith('LIVE') ? 'Live' : 'Simulated'}</span>`;
+
+export function createSpaceView() {
+    const el = document.createElement('div');
+    el.className = 'view panels cols-2';
+    el.innerHTML = `
+    <section class="surface wide">
+      <div class="block">
+        <div class="block-head"><h2>Close approaches</h2><button class="explain" data-explain="conj" aria-label="About conjunction screening">?</button></div>
+        <table class="table" aria-label="Upcoming close approaches">
+          <thead><tr><th>Object</th><th class="num">Closest approach in</th><th class="num">Miss distance</th><th class="num">Uncertainty σ</th><th class="num">Pc</th><th>Risk</th></tr></thead>
+          <tbody id="sp-conj"></tbody>
+        </table>
+      </div>
+      <div class="block">
+        <div class="block-head"><h3 id="bp-title">B-plane</h3><button class="explain" data-explain="bplane" aria-label="About the B-plane">?</button></div>
+        <div class="bplane">
+          <svg id="bp-svg" viewBox="-120 -120 240 240" role="img" aria-label="B-plane geometry"></svg>
+          <div>
+            <div class="rows" id="bp-rows"><p class="empty">Select an approach to see its geometry.</p></div>
+            <div class="suggest" id="bp-suggest" hidden></div>
+          </div>
+        </div>
+      </div>
+      <div class="block">
+        <div class="block-head"><h3>Recent passes</h3></div>
+        <div class="rows" id="sp-hist"><p class="empty">None yet.</p></div>
+      </div>
+    </section>
+
+    <section class="surface">
+      <div class="block">
+        <div class="block-head"><h2>Space weather</h2><button class="explain" data-explain="weather" aria-label="About space weather">?</button></div>
+        <div class="rows">
+          <div class="row"><span>Geomagnetic Kp</span><span id="sw-kp">—</span></div>
+          <div class="row"><span>Solar flux F10.7</span><span id="sw-f107">—</span></div>
+          <div class="row"><span>Last flare</span><span id="sw-flare">—</span></div>
+        </div>
+      </div>
+      <div class="block">
+        <div class="block-head"><h3>Incoming</h3></div>
+        <div class="rows" id="sw-pending"></div>
+      </div>
+      <div class="block">
+        <div class="block-head"><h3>Radiation</h3><span id="rad-saa"></span></div>
+        <div class="big" id="rad-now">—</div>
+        <div class="spark"><canvas id="rad-spark" aria-label="Dose rate history"></canvas><div class="spark-readout"></div></div>
+        <div class="rows">
+          <div class="row"><span>Mission dose</span><span id="rad-cum">—</span></div>
+          <div class="row"><span>Computer upsets since reboot</span><span id="rad-seu">—</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="surface">
+      <div class="block">
+        <div class="block-head"><h2>Radio link</h2><span class="tag" id="cm-tag"></span></div>
+        <div class="rows">
+          <div class="row"><span>Ground station</span><span id="cm-gs">—</span></div>
+          <div class="row"><span>Elevation, range</span><span id="cm-geo">—</span></div>
+          <div class="row"><span>Received signal</span><span id="cm-sig">—</span></div>
+          <div class="row"><span>Data rate</span><span id="cm-rate">—</span></div>
+          <div class="row"><span>One-way delay</span><span id="cm-lat">—</span></div>
+          <div class="row"><span>Next pass</span><span id="cm-next">—</span></div>
+          <div class="row"><span>Images captured</span><span id="cm-img">—</span></div>
+          <div class="row"><span>Downlinked, waiting</span><span id="cm-data">—</span></div>
+        </div>
+      </div>
+      <div class="block">
+        <div class="block-head"><h3>Magnetic field</h3><span class="block-note">Tilted-dipole model</span></div>
+        <div class="big" id="mag-total">—</div>
+        <div class="rows">
+          <div class="row"><span>North, east, down</span><span id="mag-ned">—</span></div>
+          <div class="row"><span>Declination, inclination</span><span id="mag-dec">—</span></div>
+          <div class="row"><span>Storm disturbance</span><span id="mag-pert">—</span></div>
+        </div>
+      </div>
+    </section>`;
+
+    let interval, selectedSeq = null;
+
+    function drawBPlane(ev, st) {
+        const svg = el.querySelector('#bp-svg');
+        svg.style.display = ev ? '' : 'none';
+        if (!ev) { svg.innerHTML = ''; return; }
+        const s3 = 3 * ev.sigma_m;
+        const extent = Math.max(s3, ev.missDistance_m) * 1.25;
+        const k = 110 / extent;
+        const mx = ev.zeta * k, my = -ev.xi * k;
+        const hb = Math.max(2.5, ev.hardBodyRadius_m * k);
+        const scaleM = Math.pow(10, Math.floor(Math.log10(extent / 2)));
+        svg.innerHTML = `
+          <line x1="-120" y1="0" x2="120" y2="0" stroke="var(--line)"/>
+          <line x1="0" y1="-120" x2="0" y2="120" stroke="var(--line)"/>
+          <text x="114" y="-6" text-anchor="end" fill="var(--ink-faint)" font-size="10">along-track</text>
+          <text x="4" y="-108" fill="var(--ink-faint)" font-size="10">up</text>
+          <circle cx="${mx}" cy="${my}" r="${s3 * k}" fill="rgba(240,84,79,0.06)" stroke="${esc(ev.riskColor)}" stroke-dasharray="3 3" stroke-opacity="0.6"/>
+          <circle cx="${mx}" cy="${my}" r="${ev.sigma_m * k}" fill="rgba(240,84,79,0.12)" stroke="${esc(ev.riskColor)}" stroke-opacity="0.9"/>
+          <line x1="0" y1="0" x2="${mx}" y2="${my}" stroke="var(--ink-dim)" stroke-width="1.5"/>
+          <circle cx="${mx}" cy="${my}" r="3.5" fill="${esc(ev.riskColor)}"/>
+          <circle cx="0" cy="0" r="${hb}" fill="var(--accent)" fill-opacity="0.35" stroke="var(--accent)"/>
+          <line x1="-110" y1="110" x2="${-110 + scaleM * k}" y2="110" stroke="var(--ink-dim)" stroke-width="2"/>
+          <text x="-110" y="104" fill="var(--ink-dim)" font-size="10">${scaleM >= 1000 ? `${scaleM / 1000} km` : `${scaleM} m`}</text>`;
+        el.querySelector('#bp-rows').innerHTML = `
+          <div class="row"><span>Object</span><span>${esc(ev.id)}</span></div>
+          <div class="row"><span>Closest approach in</span><span>${esc(fmt.dur(ev.timeToTca_s))}</span></div>
+          <div class="row"><span>Predicted miss</span><span>${ev.missDistance_m.toFixed(0)} m (${ev.xi >= 0 ? 'above' : 'below'} by ${Math.abs(ev.xi).toFixed(0)} m)</span></div>
+          <div class="row"><span>Uncertainty σ</span><span>${ev.sigma_m.toFixed(0)} m</span></div>
+          <div class="row"><span>Relative speed, crossing</span><span>${(ev.relVel_ms / 1000).toFixed(2)} km/s, ${ev.crossingDeg.toFixed(0)}°</span></div>
+          <div class="row"><span>Collision probability</span><span style="color:${esc(ev.riskColor)}">${esc(ev.pcFormatted)} (${esc(ev.riskLabel.toLowerCase())})</span></div>
+          <div class="row"><span>Peak Pc so far</span><span>${ev.peakPc.toExponential(1)}${ev.maneuvered ? ', manoeuvred' : ''}</span></div>`;
+        const sug = el.querySelector('#bp-suggest');
+        if (ev.pc >= 1e-5) {
+            const n = meanMotion(st.orbit.baseAltitude);
+            const sol = app.sat.conjunctions.solveAvoidance(st.missionTime, n, { maxDv: 1.0 });
+            const dir = sol ? (sol.vectorRTN[1] > 0 ? 'prograde' : sol.vectorRTN[1] < 0 ? 'retrograde' : sol.vectorRTN[0] > 0 ? 'radial out' : 'radial in') : '';
+            sug.hidden = false;
+            sug.textContent = sol
+                ? `Smallest burn that clears every upcoming approach right now: ${sol.deltaV.toFixed(2)} m/s ${dir} (worst Pc after: ${sol.worstPc.toExponential(1)}). The planner decides whether and when to fire.`
+                : 'No burn up to 1 m/s clears every approach from here.';
+        } else sug.hidden = true;
     }
-  };
-}
 
-function setText(id, text) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = text;
-}
+    function update() {
+        const st = app.sat.getFullState();
+        const evs = st.conjunctions;
+        if (!evs.some(e => e.seq === selectedSeq)) selectedSeq = evs.reduce((a, b) => (!a || b.pc > a.pc ? b : a), null)?.seq ?? null;
+        const tb = el.querySelector('#sp-conj');
+        tb.innerHTML = evs.length ? evs.map(e => `
+          <tr data-seq="${e.seq}" aria-selected="${e.seq === selectedSeq}" tabindex="0">
+            <td>${esc(e.name)}</td><td class="num">${esc(fmt.dur(e.timeToTca_s))}</td>
+            <td class="num">${e.missDistance_m >= 1000 ? `${(e.missDistance_m / 1000).toFixed(2)} km` : `${e.missDistance_m.toFixed(0)} m`}</td>
+            <td class="num">${e.sigma_m.toFixed(0)} m</td><td class="num">${esc(e.pcFormatted)}</td>
+            <td><span class="tag" data-status="${e.pc >= 1e-4 ? 'critical' : e.pc >= 1e-5 ? 'warning' : 'nominal'}">${esc(e.riskLabel[0] + e.riskLabel.slice(1).toLowerCase())}</span></td>
+          </tr>`).join('') : '<tr class="empty-row"><td colspan="6">Nothing in the screening window. New approaches are reported a few hours ahead.</td></tr>';
+        tb.querySelectorAll('tr[data-seq]').forEach(tr => {
+            const pick = () => { selectedSeq = +tr.dataset.seq; update(); };
+            tr.addEventListener('click', pick);
+            tr.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+        });
+        const sel = evs.find(e => e.seq === selectedSeq);
+        setText(el, '#bp-title', sel ? `B-plane: ${sel.name}` : 'B-plane');
+        drawBPlane(sel, st);
+        if (!sel) { el.querySelector('#bp-rows').innerHTML = '<p class="empty">Select an approach to see its geometry.</p>'; el.querySelector('#bp-suggest').hidden = true; }
 
-function timeSince(ts) {
-  const sec = Math.floor((Date.now() - ts) / 1000);
-  if (sec < 60) return `${sec}s ago`;
-  return `${Math.floor(sec / 60)}m ago`;
+        el.querySelector('#sp-hist').innerHTML = st.conjunctionHistory.length ? st.conjunctionHistory.slice(0, 5).map(h =>
+            `<div class="row"><span>${esc(h.name)}${h.maneuvered ? ', after a burn' : ''}</span><span>missed by ${h.realizedMiss_m >= 1000 ? `${(h.realizedMiss_m / 1000).toFixed(2)} km` : `${h.realizedMiss_m.toFixed(0)} m`}</span></div>`).join('')
+            : '<p class="empty">None yet.</p>';
+
+        // space weather
+        const sw = st.spaceWeather;
+        el.querySelector('#sw-kp').innerHTML = `${sw.kp.toFixed(1)} ${badge(app.sources.kp)}`;
+        el.querySelector('#sw-f107').innerHTML = `${sw.f107.toFixed(0)} sfu ${badge(app.sources.f107)}`;
+        setText(el, '#sw-flare', sw.lastFlare ? `${sw.lastFlare.classType}, ${String(sw.lastFlare.beginTime).slice(0, 16).replace('T', ' ')}` : 'None reported');
+        el.querySelector('#sw-pending').innerHTML = sw.pending.length ? sw.pending.map(p =>
+            `<div class="row"><span>${p.type === 'SEP' ? 'Solar protons' : 'CME storm'}: ${esc(p.label)}</span><span>in ${esc(fmt.dur(p.inS))}</span></div>`).join('')
+            : '<p class="empty">Nothing on the way.</p>';
+        const rd = st.sensors.radiationDetector;
+        setText(el, '#rad-now', `${rd.currentDose.toFixed(3)} mSv/h`);
+        el.querySelector('#rad-now').style.color = rd.currentDose > 1 ? 'var(--critical)' : rd.currentDose > 0.2 ? 'var(--caution)' : '';
+        el.querySelector('#rad-saa').innerHTML = rd.saaPassingGrade ? '<span class="tag" data-status="warning">South Atlantic Anomaly</span>' : '';
+        setText(el, '#rad-cum', `${rd.cumulativeDose.toFixed(3)} mSv`);
+        setText(el, '#rad-seu', `${st.sections.onboardComputer.errorCount}`);
+        drawSparkline(el.querySelector('#rad-spark'), st.history.slice(-240).map(h => ({ t: h.t, v: h.dose })), { min: 0, format: v => `${v.toFixed(3)} mSv/h` });
+
+        // comms
+        const c = st.sections.commArray, o = st.orbit;
+        const tag = el.querySelector('#cm-tag');
+        tag.dataset.status = !c.antennaOk ? 'critical' : c.linkStatus === 'LOST' ? '' : 'good';
+        tag.textContent = !c.antennaOk ? 'Radio locked up' : c.linkStatus === 'LOST' ? 'No station in view' : c.linkStatus === 'STRONG' ? 'Strong link' : 'Weak link';
+        setText(el, '#cm-gs', c.station || 'None in view');
+        setText(el, '#cm-geo', `${c.elevationDeg.toFixed(1)}°, ${fmt.int(c.rangeKm)} km`);
+        setText(el, '#cm-sig', c.linkStatus === 'LOST' ? '—' : `${c.signalStrength.toFixed(1)} dBm`);
+        setText(el, '#cm-rate', c.dataRate ? `${c.dataRate} bit/s` : '—');
+        setText(el, '#cm-lat', c.signalLatency_ms ? `${c.signalLatency_ms.toFixed(1)} ms` : '—');
+        const np = o.nextContact;
+        setText(el, '#cm-next', !np ? 'None in the next 24 h' : o.timeToNextContact === 0 ? `Now, ${np.durationMin.toFixed(0)} min pass` : `${np.station} in ${fmt.dur(o.timeToNextContact * 60)}, ${np.durationMin.toFixed(0)} min, peak ${np.maxElevation.toFixed(0)}°`);
+        setText(el, '#cm-img', `${st.mission.imagesCaptured}`);
+        setText(el, '#cm-data', `${(st.mission.dataDownlinkedMB * 1000).toFixed(0)} kB sent, ${(st.mission.dataBufferedMB * 1000).toFixed(0)} kB queued`);
+
+        const mag = st.sensors.magnetometer;
+        setText(el, '#mag-total', `${fmt.int(mag.fieldStrength)} nT`);
+        const ned = mag.components || { north: 0, east: 0, down: 0 };
+        setText(el, '#mag-ned', `${fmt.int(ned.north)}, ${fmt.int(ned.east)}, ${fmt.int(ned.down)} nT`);
+        setText(el, '#mag-dec', `${st.environment.magneticDeclination.toFixed(1)}°, ${st.environment.magneticInclination.toFixed(1)}°`);
+        setText(el, '#mag-pert', mag.perturbation ? `${mag.perturbation.toFixed(0)} nT${mag.anomalyDetected ? ' (anomaly)' : ''}` : 'None');
+    }
+
+    return {
+        element: el,
+        init() { bindExplainers(el, EXPLAIN); update(); interval = setInterval(update, 1000); },
+        destroy() { clearInterval(interval); },
+    };
 }

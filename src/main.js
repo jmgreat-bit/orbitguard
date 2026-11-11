@@ -1,187 +1,311 @@
+/**
+ * Mission director: one simulation clock, the planner schedule, and the event log.
+ *
+ * - Physics runs at 10 Hz real time; each tick advances the simulation by real dt × warp
+ *   (the satellite sub-steps internally, so physics is the same at any warp).
+ * - Planning: every 15 s, and within ~1.5 s of anything important (a conjunction that is
+ *   new or has just crossed the manoeuvre threshold, safety override, CME, drills). Gemini
+ *   plans when the server has a key; otherwise, or when it fails, the deterministic
+ *   autopilot plans.
+ * - The collision backstop does not live on this wall-clock schedule: the simulation calls
+ *   it every 30 simulated seconds, so it behaves the same at 1× and 500×.
+ * - A planner reply is only useful if the spacecraft has not moved on. At a warp where
+ *   Gemini's reply would be stale (latency × warp > the plan age limit) the autopilot plans
+ *   routine cycles and Gemini is asked only about alerts, with the warp held down for it.
+ * - Critical events drop the time warp so you can watch the response (toggle in the top bar).
+ */
 import { VirtualSatellite } from './satellite.js';
-import { SatelliteBrain, AI_LOG, logDecision } from './ai-brain.js';
+import { DataService } from './data-service.js';
+import { SatelliteBrain } from './ai-brain.js';
+import { Autopilot } from './autonomy/autopilot.js';
+import { MAX_PLAN_AGE_S } from './autonomy/plan.js';
+import { logEvent, setMissionClock } from './log.js';
 import { Router } from './router.js';
+import { app, TIME_SPEEDS } from './app.js';
 import { createHomeView } from './views/home.js';
 import { createShipView } from './views/ship.js';
 import { createEngineView } from './views/engine.js';
 import { createSpaceView } from './views/space.js';
 import { createCrisisView } from './views/crisis.js';
 import { initCrisisAlert, fireCrisisAlert } from './ui/CrisisAlert.js';
+import { initModal } from './ui/modal.js';
+import { initAssistant } from './ui/Assistant.js';
+import { fmt, describeCommand } from './ui/dom.js';
 
-// Loaded from `.env` (see .env.example). Never hardcode the key here.
-// If it's missing the sim still runs — FlightController falls back to safety rules.
-const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
+const PLAN_INTERVAL_MS = 15000;
+const data = new DataService();
+const brain = new SatelliteBrain();
+const autopilot = new Autopilot();
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Time Acceleration — global multiplier
-// ─────────────────────────────────────────────────────────────────────────────
-const TIME_SPEEDS = [1, 5, 10, 50, 100];
-let timeSpeedIndex = 0;
-let timeMultiplier = 1;
-
-function setTimeSpeed(idx) {
-    timeSpeedIndex = Math.max(0, Math.min(TIME_SPEEDS.length - 1, idx));
-    timeMultiplier = TIME_SPEEDS[timeSpeedIndex];
-    const el = document.getElementById('time-speed');
-    if (el) el.textContent = `${timeMultiplier}×`;
-    const cls = document.getElementById('time-speed-btn');
-    if (cls) cls.classList.toggle('speed-fast', timeMultiplier > 1);
-    logDecision({ action: 'SIM_SPEED', reason: `Simulation speed set to ${timeMultiplier}×`, threat_level: 'nominal' });
+function priorityLevel(p) {
+    return { CRITICAL: 'critical', HIGH: 'warning', MEDIUM: 'caution', LOW: 'nominal' }[p] || 'nominal';
 }
 
-let satellite = null;
-let aiBrain = null;
+// ── time warp ───────────────────────────────────────────────────────────────
+function setWarp(speed, why) {
+    const s = TIME_SPEEDS.includes(speed) ? speed : TIME_SPEEDS[0];
+    if (s === app.warp) return;
+    app.warp = s;
+    document.getElementById('time-speed').textContent = `${s}×`;
+    document.getElementById('time-speed-btn').dataset.fast = s > 1 ? 'true' : 'false';
+    if (why) logEvent({ action: 'TIME_WARP', reason: `Time warp ${s}× — ${why}`, level: 'nominal', source: 'operator' });
+}
+function slowFor(reason, cap = 1) {
+    if (app.autoSlow && app.warp > cap) setWarp(cap, reason);
+}
 
-async function init() {
-    satellite = new VirtualSatellite();
+// ── planning ────────────────────────────────────────────────────────────────
+let decisionTimer = null;
+let lastDecision = 0;
+let deciding = false;
+let geminiBackoffUntil = 0;
+let lastDecisionSim = 0;
+const AUTOPILOT_SIM_INTERVAL_S = 300; // at high warp the autopilot also plans every 5 simulated minutes
 
-    // ── Physics tick — respects timeMultiplier ──
-    // We run the update loop at 10Hz but scale the dt by timeMultiplier
-    let lastPhysicsTick = Date.now();
-    setInterval(() => {
-        const now = Date.now();
-        const realDt = now - lastPhysicsTick;
-        lastPhysicsTick = now;
+const ALERT_REASONS = new Set(['conjunction', 'override', 'drill', 'operator']);
+let pendingReason = null;
+function requestDecision(reason) {
+    // An alert outranks a routine reason that is already waiting.
+    if (!pendingReason || ALERT_REASONS.has(reason)) pendingReason = reason;
+    if (decisionTimer) return;
+    const wait = Math.max(1500, 5000 - (Date.now() - lastDecision));
+    decisionTimer = setTimeout(() => { decisionTimer = null; const r = pendingReason; pendingReason = null; decide(r); }, wait);
+}
 
-        // Inject scaled time into satellite
-        const scaledDt = realDt * timeMultiplier;
-        satellite._scaledUpdate(scaledDt);
-
-        // CME arrivals
-        if (aiBrain) aiBrain.processCME(satellite);
-
-        // Mission clock
-        const s = Math.floor(satellite.missionTime);
-        const h = Math.floor(s / 3600);
-        const m = Math.floor((s % 3600) / 60);
-        const sc = s % 60;
-        const el = document.getElementById('mission-time');
-        if (el) el.textContent = `T+${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sc).padStart(2, '0')}`;
-    }, 100); // 10 Hz
-
-    // ── Router ──
-    const router = new Router('page-content');
-    router.register('home', () => createHomeView(satellite));
-    router.register('ship', () => createShipView(satellite));
-    router.register('engine', () => createEngineView(satellite));
-    router.register('space', () => createSpaceView(satellite));
-    router.register('crisis', () => createCrisisView(satellite, aiBrain));
-    router.navigate('home');
-
-    // ── AI Brain ──
-    if (!GEMINI_API_KEY || GEMINI_API_KEY === 'your_api_key_here') {
-        console.warn('⚠️ No VITE_GEMINI_API_KEY found — copy .env.example to .env to enable the AI planner.');
-        logDecision({ action: 'AI_OFFLINE', reason: 'No API key configured. Flight computer running on deterministic safety rules.', threat_level: 'warning' });
-    } else {
-        try {
-            aiBrain = new SatelliteBrain(GEMINI_API_KEY);
-            await aiBrain.initialize();
-            logDecision({ action: 'AI_ONLINE', reason: 'Gemini 2.5 Flash autonomy loop initialized. Monitoring all channels.', threat_level: 'nominal' });
-            console.log('✅ AI brain online');
-        } catch (e) {
-            console.warn('⚠️ AI init failed:', e.message);
-            logDecision({ action: 'AI_OFFLINE', reason: `AI initialization failed: ${e.message}. Emergency rules active.`, threat_level: 'warning' });
-        }
+/** Submit a plan to the flight controller and log it. Returns the controller's verdict. */
+function submit(plan, source) {
+    const sat = app.sat;
+    const res = sat.flightController.submitPlan(plan, source);
+    if (!res.plan || res.reason === 'stale') return res; // the controller's 'rejected' event is already in the log
+    const p = res.plan;
+    app.planner.lastSummary = p.summary;
+    if (!p.commands.length) {
+        logEvent({ action: 'HOLD', reason: p.summary, level: 'nominal', source });
+        return res;
     }
+    if (!res.accepted) return res;
+    logEvent({
+        action: p.commands.map(c => c.type).join(' + '),
+        reason: `${p.summary} [${p.commands.map(describeCommand).join('; ')}]`,
+        level: priorityLevel(p.priority), source, params: p.commands,
+    });
+    if (p.priority === 'CRITICAL') fireCrisisAlert({ ...p, reason: p.summary }, sat);
+    return res;
+}
 
-    // ── AI decision loop — every 15s (real time, not scaled) ──
-    setInterval(async () => {
-        if (!aiBrain || !aiBrain.model) return;
-        try {
-            // Pass the entire satellite instance so ai-brain can access satellite.flightController
-            const result = await aiBrain.decide(satellite);
+// ── Gemini and time warp ────────────────────────────────────────────────────
+const geminiAvailable = () => app.planner.mode === 'auto' && brain.status.online && Date.now() > geminiBackoffUntil;
+/** Expected reply time in wall seconds (last measured, or a cautious first guess). */
+const geminiLatencyS = () => (brain.lastLatencyMs ?? 4000) / 1000;
+/** Fastest warp at which a reply still lands inside the plan age limit, with 25 % margin. */
+const geminiMaxWarp = () => [...TIME_SPEEDS].reverse().find(s => s * geminiLatencyS() <= MAX_PLAN_AGE_S * 0.75) ?? TIME_SPEEDS[0];
+const geminiFitsWarp = () => app.warp <= geminiMaxWarp();
 
-            // Store threat + forecast on satellite for views to read
-            satellite._lastThreat = result.priority?.toLowerCase() || 'nominal';
-            satellite._lastForecast = result.reason || '';
-
-            // Fire Crisis Alert popup for HIGH / EMERGENCY plans
-            if (result.priority === 'EMERGENCY' || result.priority === 'HIGH') {
-                fireCrisisAlert(result, satellite);
+async function decide(reason = 'scheduled') {
+    const sat = app.sat;
+    if (!sat || deciding || sat.mission.lost) return;
+    if (sat.obcDown) return;
+    deciding = true;
+    lastDecision = Date.now();
+    lastDecisionSim = sat.missionTime;
+    try {
+        let useGemini = geminiAvailable();
+        if (useGemini && !geminiFitsWarp()) {
+            const cap = geminiMaxWarp();
+            if (ALERT_REASONS.has(reason) && app.autoSlow) {
+                setWarp(cap, `holding for the Gemini planner (${reason})`);
+            } else {
+                useGemini = false;
+                app.planner.status = `Autopilot planning at ${app.warp}× — a Gemini reply would be stale by the time it arrived. Gemini plans at ${cap}× or slower${app.autoSlow ? ', and on alerts' : ''}.`;
             }
-
-            // Note: We no longer execute commands here.
-            // The AI Brain pushes the JSON sequence into FlightController.processAIPlan,
-            // and physics.js executes the queue loop.
-
-        } catch (e) {
-            console.error('AI loop error:', e);
         }
-    }, 15000);
-
-    // ── Time speed buttons ──
-    document.getElementById('time-slower')?.addEventListener('click', () => setTimeSpeed(timeSpeedIndex - 1));
-    document.getElementById('time-faster')?.addEventListener('click', () => setTimeSpeed(timeSpeedIndex + 1));
-    document.getElementById('time-speed-btn')?.addEventListener('click', () => {
-        // Cycle through speeds on tap
-        setTimeSpeed((timeSpeedIndex + 1) % TIME_SPEEDS.length);
-    });
-
-    initModals();
-    initCrisisAlert();
-
-    // ── Safety Override Crisis Popup — fires from FlightController.tick() ──
-    let lastSafetyAlertTime = 0;
-    window.addEventListener('safety-override', (e) => {
-        const now = Date.now();
-        if (now - lastSafetyAlertTime < 30000) return; // throttle: max one popup per 30s
-        lastSafetyAlertTime = now;
-        fireCrisisAlert(e.detail, satellite);
-    });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Universal Card Modal Framework (v3)
-// ─────────────────────────────────────────────────────────────────────────────
-
-export function showModal(title, htmlContent, isExpand = false) {
-    const overlay = document.getElementById('card-modal');
-    const contentBox = document.getElementById('card-modal-content');
-
-    document.getElementById('card-modal-title').textContent = title;
-    document.getElementById('card-modal-body').innerHTML = htmlContent;
-
-    if (isExpand) {
-        contentBox.classList.add('expand-mode');
-    } else {
-        contentBox.classList.remove('expand-mode');
+        if (useGemini) {
+            try {
+                const basedOnT = sat.missionTime;
+                const raw = await brain.decide(sat.getFullState(), sat.avoidanceOption());
+                app.planner.lastLatencyMs = brain.lastLatencyMs;
+                const res = submit({ ...raw, plan_id: `gemini_${Date.now()}`, basedOnT }, 'gemini');
+                if (res?.reason !== 'stale') {
+                    app.planner.using = 'gemini';
+                    app.planner.status = `Gemini (${brain.status.model}) planning — ${(brain.lastLatencyMs / 1000).toFixed(1)} s per decision`;
+                    return;
+                }
+                app.planner.status = `Gemini's reply arrived ${Math.round(sat.missionTime - basedOnT)} simulated seconds late and was discarded — autopilot planned this cycle`;
+            } catch (e) {
+                logEvent({ action: 'AI_ERROR', reason: `Gemini request failed (${e.message}). Autopilot planned this cycle.`, level: 'warning', source: 'gemini' });
+                if (brain.failures >= 3) {
+                    geminiBackoffUntil = Date.now() + 120000;
+                    app.planner.status = 'Gemini failing — autopilot for 2 minutes, then retrying';
+                }
+            }
+        }
+        app.planner.using = 'autopilot';
+        const p = autopilot.decide(sat);
+        if (p?.info) logEvent({ action: 'NOTE', reason: p.info, level: 'warning', source: 'autopilot' });
+        else if (p) submit(p, 'autopilot');
+    } finally {
+        app.planner.lastDecisionAt = Date.now();
+        deciding = false;
     }
-
-    overlay.classList.add('open');
 }
 
-export function hideModal() {
-    document.getElementById('card-modal').classList.remove('open');
-}
-
-function initModals() {
-    const overlay = document.getElementById('card-modal');
-    document.getElementById('card-modal-close').addEventListener('click', hideModal);
-    overlay.addEventListener('click', (e) => {
-        if (e.target === overlay) hideModal();
-    });
-    window.addEventListener('keydown', (e) => {
-        if (e.key.toLowerCase() === 'e') {
-            satellite.executeAction('evasion_burn', { deltaV_ms: 1.5 });
-            console.log("🔥 MANUAL BURN: 1.5 m/s");
+// ── live data ───────────────────────────────────────────────────────────────
+async function refreshSpaceWeather() {
+    const sw = await data.getSpaceWeather().catch(() => null);
+    const W = app.sat.spaceWeather;
+    if (!sw) return;
+    W.setLive({ kp: sw.kp, f107: sw.f107 });
+    app.sources.kp = W.source.kp;
+    app.sources.f107 = W.source.f107;
+    if (Array.isArray(sw.flares) && sw.via === 'server') {
+        app.sources.flares = 'LIVE';
+        const recent = sw.flares.filter(f => Date.now() - Date.parse(f.beginTime) < 6 * 3600_000);
+        for (const f of recent) {
+            const note = W.ingestFlare(f, app.sat.missionTime);
+            if (note) { logEvent({ action: 'SOLAR_FLARE', reason: `NASA DONKI: ${note}`, level: 'warning', source: 'nasa' }); requestDecision('flare'); }
         }
-        if (e.key.toLowerCase() === 'f') {
-            // Test FlightController manual override
-            satellite.flightController.processAIPlan({
-                priority: "HIGH",
-                summary: "Manual Keyboard Override",
-                commands: [
-                    { type: 'PLAN_BURN', params: { vector: [1, 0, 0], delta_v: 1.0, reason: "Manual Boost" }, duration: 1 },
-                    { type: 'EXECUTE_BURN', params: {}, duration: 10 }
-                ],
-                plan_id: `manual_${Date.now()}`
+    }
+}
+
+// ── boot ────────────────────────────────────────────────────────────────────
+function init() {
+    const sat = new VirtualSatellite({ epochMs: Date.now() });
+    app.sat = sat;
+    window.orbitguard = app; // handy in the browser console
+    setMissionClock(() => sat.missionTime);
+    initModal();
+    initCrisisAlert();
+    initAssistant();
+
+    // Collision backstop: called by the simulation every 30 simulated seconds.
+    sat.setBackstop(() => {
+        const b = autopilot.backstop(sat);
+        if (b?.commands) submit(b, 'autopilot');
+        else if (b?.info) logEvent({ action: 'NOTE', reason: b.info, level: 'warning', source: 'autopilot' });
+    });
+
+    // Simulation events → log, alerts, planner triggers
+    sat.on('safety-override', d => {
+        logEvent({ action: d.code, reason: d.summary, level: 'critical', source: 'supervisor' });
+        fireCrisisAlert(d, sat);
+        slowFor('safety override');
+        requestDecision('override');
+    });
+    sat.on('safety-clear', d => logEvent({ action: `${d.code}_CLEARED`, reason: d.summary, level: 'nominal', source: 'supervisor' }));
+    sat.on('space-weather', d => {
+        logEvent({ ...d, source: 'space weather' });
+        if (d.action === 'CME_IMPACT' || d.action === 'SEP_ARRIVAL') slowFor(d.action === 'CME_IMPACT' ? 'CME arrival' : 'solar protons arriving', 5);
+        requestDecision('space weather');
+    });
+    sat.on('obc', d => logEvent({ ...d, source: 'obc' }));
+    sat.on('conjunction', ({ type, event: e }) => {
+        if (type === 'escalated') {
+            logEvent({ action: 'CONJUNCTION_RED', reason: `${e.id}: tracking has tightened and Pc is now ${e.pcFormatted}, above the 1e-4 manoeuvre threshold. TCA in ${fmt.dur(e.timeToTca_s)}, miss ${e.missDistance_m.toFixed(0)} m.`, level: 'critical', source: 'screening' });
+            slowFor('conjunction crossed the manoeuvre threshold', 10);
+            requestDecision('conjunction');
+        } else if (type === 'new') {
+            if (e.pc >= 1e-5) {
+                logEvent({ action: 'CONJUNCTION', reason: `${e.id}: TCA in ${fmt.dur(e.timeToTca_s)}, miss ${e.missDistance_m.toFixed(0)} m, Pc ${e.pcFormatted}`, level: e.pc >= 1e-4 ? 'critical' : 'warning', source: 'screening' });
+                if (e.pc >= 1e-4) slowFor('high-risk conjunction', 10);
+                requestDecision('conjunction');
+            }
+        } else if (type === 'passed') {
+            logEvent({
+                action: e.collision ? 'COLLISION' : 'TCA_PASSED',
+                reason: `${e.id}: actual miss ${e.realizedMiss_m.toFixed(0)} m (peak Pc ${e.peakPc.toExponential(1)}${e.maneuvered ? ', after avoidance burn' : ''})`,
+                level: e.collision ? 'critical' : 'nominal', source: 'screening',
             });
-            console.log("🔥 FLIGHT CONTROLLER INJECT: 1.0 m/s Burn");
-        }
-        if (e.key === 'Escape' && overlay.classList.contains('open')) {
-            hideModal();
         }
     });
+    sat.on('plan', e => {
+        if (e.kind === 'vetoed' || e.kind === 'rejected') logEvent({ action: e.kind === 'vetoed' ? 'VETOED' : 'REJECTED', reason: `${e.command}: ${e.reason}`, level: 'warning', source: e.kind === 'vetoed' ? 'supervisor' : 'validator' });
+        else if (e.kind === 'aborted') logEvent({ action: 'PLAN_ABORTED', reason: `${e.plan.summary.slice(0, 120)} — ${e.reason}`, level: 'warning', source: 'controller' });
+        else if (e.kind === 'burn-complete') {
+            logEvent({ action: 'BURN_COMPLETE', reason: `${e.burn.delivered.toFixed(3)} m/s delivered. ${sat.sections.thrusterPod.fuelMass.toFixed(1)} g propellant left (${sat.propulsion.remainingDeltaV.toFixed(1)} m/s).`, level: 'nominal', source: 'controller' });
+            requestDecision('burn complete');
+        }
+    });
+    sat.on('mission-lost', d => {
+        logEvent({ action: 'MISSION_LOST', reason: d.reason, level: 'critical', source: 'simulation' });
+        const ov = document.getElementById('mission-lost');
+        ov.querySelector('[data-reason]').textContent = d.reason;
+        ov.querySelector('[data-stats]').textContent =
+            `${fmt.clock(sat.missionTime)} flown, ${sat.mission.imagesCaptured} images, ${sat.mission.maneuvers} manoeuvres, ${sat.mission.conjunctionsPassed} conjunctions passed.`;
+        ov.hidden = false;
+        setWarp(1);
+    });
+
+    // Physics loop
+    let last = performance.now();
+    let errorShown = 0;
+    setInterval(() => {
+        const now = performance.now();
+        const dt = Math.min(1, (now - last) / 1000);
+        last = now;
+        try {
+            if (!app.paused) sat.step(dt * app.warp);
+        } catch (e) {
+            if (Date.now() - errorShown > 10000) { errorShown = Date.now(); console.error('Simulation step failed', e); logEvent({ action: 'SIM_ERROR', reason: e.message, level: 'critical', source: 'simulation' }); }
+        }
+        // Whenever Gemini is not the one planning routine cycles, the autopilot plans on simulation time.
+        const geminiRoutine = geminiAvailable() && geminiFitsWarp();
+        if (!geminiRoutine && !deciding && sat.missionTime - lastDecisionSim > AUTOPILOT_SIM_INTERVAL_S) decide('sim interval');
+        document.getElementById('mission-time').textContent = fmt.clock(sat.missionTime);
+        document.getElementById('utc-time').textContent = new Date(sat.simTimeMs).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+    }, 100);
+
+    // Views
+    const router = new Router('page-content');
+    router.register('home', () => createHomeView());
+    router.register('ship', () => createShipView());
+    router.register('engine', () => createEngineView());
+    router.register('space', () => createSpaceView());
+    router.register('crisis', () => createCrisisView());
+    router.navigate();
+
+    // Top-bar controls
+    const idx = () => TIME_SPEEDS.indexOf(app.warp);
+    document.getElementById('time-slower').addEventListener('click', () => setWarp(TIME_SPEEDS[Math.max(0, idx() - 1)]));
+    document.getElementById('time-faster').addEventListener('click', () => setWarp(TIME_SPEEDS[Math.min(TIME_SPEEDS.length - 1, idx() + 1)]));
+    document.getElementById('time-speed-btn').addEventListener('click', () => {
+        app.paused = !app.paused;
+        document.getElementById('time-speed-btn').dataset.paused = String(app.paused);
+        document.getElementById('time-speed-btn').setAttribute('aria-pressed', String(app.paused));
+        document.getElementById('time-speed').textContent = app.paused ? 'Paused' : `${app.warp}×`;
+    });
+    const auto = document.getElementById('auto-slow');
+    auto.checked = app.autoSlow;
+    auto.addEventListener('change', () => { app.autoSlow = auto.checked; });
+    document.getElementById('mission-restart').addEventListener('click', () => location.reload());
+
+    app.setWarp = setWarp;
+    app.requestDecision = requestDecision;
+    app.injectDrill = (id) => {
+        const entry = sat.injectEvent(id);
+        if (entry) logEvent({ ...entry, source: 'drill' });
+        requestDecision('drill');
+    };
+
+    // Planner + data
+    logEvent({ action: 'MISSION_START', reason: `OrbitGuard-1 in a ${sat.orbit.baseAltitude.toFixed(0)} km, ${sat.orbit.inclination.toFixed(1)}° orbit. Simulation clock starts at the current UTC time.`, level: 'nominal', source: 'simulation' });
+    brain.checkHealth().then(s => {
+        app.planner.online = s.online;
+        app.planner.model = s.model;
+        app.planner.status = s.online ? `Gemini (${s.model}) ready` : `Autopilot planning — ${s.reason}`;
+        logEvent({ action: s.online ? 'AI_ONLINE' : 'AI_OFFLINE', reason: s.online ? `Gemini planner ready (${s.model}). The autopilot stays on as collision backstop.` : `Gemini unavailable: ${s.reason}. The rule-based autopilot is flying.`, level: s.online ? 'nominal' : 'caution', source: 'planner' });
+        decide('startup');
+    });
+    data.getOrbitalData().then(tle => {
+        if (tle && sat.adoptTle(tle)) {
+            app.sources.tle = tle.source || 'LIVE';
+            logEvent({ action: 'TLE_LOADED', reason: `Reference orbit from ${tle.name} (${tle.source}), epoch ${new Date(tle.epochMs).toISOString().slice(0, 16)} UTC: ${tle.altitude.toFixed(0)} km, ${tle.inclination.toFixed(2)}°.`, level: 'nominal', source: 'celestrak' });
+        } else {
+            logEvent({ action: 'TLE_FALLBACK', reason: 'CelesTrak unreachable — flying the built-in ISS-like reference orbit.', level: 'caution', source: 'celestrak' });
+        }
+    });
+    refreshSpaceWeather();
+    setInterval(refreshSpaceWeather, 15 * 60_000);
+    setInterval(() => decide('scheduled'), PLAN_INTERVAL_MS);
 }
 
 document.addEventListener('DOMContentLoaded', init);

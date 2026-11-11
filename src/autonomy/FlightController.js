@@ -1,279 +1,376 @@
 /**
- * FlightController.js
- * The Autonomous Flight Controller (Minimum Viable Autonomy)
- * 
- * Decouples the AI planner (Gemini 15s loop) from the Physics Executor (60Hz loop).
- * Maintains a Command Queue, executes step-by-step logic, and enforces Safety Override constraints.
+ * FlightController — executes validated plans on simulation time, under a safety
+ * supervisor the planner cannot override.
+ *
+ * What changed from the original and why:
+ *  - Steps are timed in *simulated* seconds. The old controller timed steps with
+ *    Date.now() but integrated thrust with scaled dt, so at 100× warp a burn
+ *    delivered 100× the commanded Δv.
+ *  - It writes to sections.payloadBay (it wrote to a non-existent sections.payload,
+ *    which threw on 4 of the 7 commands and wedged the queue forever).
+ *  - The supervisor reads batteryBay.charge (it read .percent, which does not exist,
+ *    so the low-battery override never fired). It latches with hysteresis, acts once
+ *    on entry, emits one event per transition (not 10 per second), and vetoes only the
+ *    commands that conflict, so a collision-avoidance burn still runs on low battery.
+ *  - Burns: PLAN_BURN registers a manoeuvre, EXECUTE_BURN aligns the thruster first,
+ *    then fires for exactly the planned Δv, consuming propellant via the rocket equation.
+ *  - Fuel reserve uses the real Δv budget computed from propellant mass.
+ *  - Plans carry the mission time of the telemetry they were planned from; one older than
+ *    MAX_PLAN_AGE_S is rejected at intake (a slow planner at high time warp).
+ *  - Every burn is checked against the whole screening list before it is armed and again
+ *    just before the thruster fires: a burn that would leave the worst collision
+ *    probability at or above the manoeuvre threshold without reducing it is vetoed,
+ *    whoever planned it.
  */
+import { validatePlan, PRIORITY_RANK, MAX_PLAN_AGE_S } from './plan.js';
+import { THERMAL_LIMITS } from '../sim/thermal.js';
+import { PC_MANEUVER_THRESHOLD } from '../sim/conjunctions.js';
+import { meanMotion, formatPc } from '../physics.js';
+
+const INTERNAL_NODES = ['batteryBay', 'onboardComputer', 'payloadBay', 'commArray', 'thrusterPod'];
+const ATTITUDE_TIMEOUT_S = 900;
+const ALIGN_TIMEOUT_S = 900;
 
 export class FlightController {
-    constructor(satellitePhysics) {
-        this.sat = satellitePhysics;
+    constructor(sat) {
+        this.sat = sat;
         this.queue = [];
+        this.current = null;          // the plan being executed
+        this.stepIndex = 0;
+        this.stepElapsed = 0;         // simulated seconds in the current step
+        this.stepState = {};
+        this.pendingBurn = null;      // { vector, deltaV, delivered, reason }
+        this.seenPlanIds = [];
+        this.supervisor = { battery: false, thermal: false };
+        this.recent = [];             // finished/aborted plans, newest first
+        // Back-compat field names used by older UI code
         this.currentCommand = null;
         this.currentStepIndex = 0;
-        this.stepStartTime = 0;
-        this.lastAiPlanId = null;
     }
 
+    // ── intake ───────────────────────────────────────────────────────────────
     /**
-     * Called by the AI Brain whenever a new JSON plan is received.
-     * @param {Object} jsonPlan 
+     * Validate and queue a plan from any planner.
+     * @returns {{accepted: boolean, plan: object|null, rejected: Array, reason?: string}}
      */
-    processAIPlan(jsonPlan) {
-        if (!jsonPlan || !jsonPlan.commands || jsonPlan.commands.length === 0) return;
-
-        // Prevent executing the exact same plan twice if the AI loops
-        if (jsonPlan.plan_id && jsonPlan.plan_id === this.lastAiPlanId) return;
-        this.lastAiPlanId = jsonPlan.plan_id;
-
-        // EMERGENCY priority overrides everything immediately
-        if (jsonPlan.priority === 'EMERGENCY') {
-            console.warn("[FLIGHT OPS] EMERGENCY OVERRIDE RECEIVED. Aborting current maneuvers.");
-            this.abortCurrent();
-        }
-
-        // Push to queue
-        this.queue.push(jsonPlan);
-        console.log(`[FLIGHT OPS] Queued new plan (Priority: ${jsonPlan.priority})`, jsonPlan);
-    }
-
-    abortCurrent() {
-        this.currentCommand = null;
-        this.queue = [];
-        this.stepStartTime = 0;
-        // reset physical actuators if they were mid-burn
-        this.sat.propulsion.isThrusting = false;
-        this.sat.sections.commArray.linkStatus = 'STRONG'; // reset comms if disabled
-    }
-
-    /**
-     * Evaluated every physics tick (`physics.js` integration loop).
-     * @param {number} dtSeconds 
-     */
-    tick(dtSeconds) {
-        // 1. SAFETY OVERRIDE (Hard limits the AI cannot ignore)
-        const safetyBlock = this.checkSafetyConstraints();
-        if (safetyBlock) {
-            if (this.currentCommand) {
-                console.warn(`[SAFETY SUPERVISOR] ABORTING MANEUVER: ${safetyBlock}`);
-                this.abortCurrent();
+    submitPlan(raw, source = 'planner') {
+        const { plan, rejected } = validatePlan(raw, source);
+        rejected.forEach(r => this._event('rejected', { plan, command: r.type, reason: r.reason }));
+        if (!plan) return { accepted: false, plan: null, rejected, reason: 'invalid plan' };
+        if (plan.basedOnT !== null) {
+            const age = this.sat.missionTime - plan.basedOnT;
+            if (age > MAX_PLAN_AGE_S) {
+                const reason = `planned from telemetry ${Math.round(age)} s old (limit ${MAX_PLAN_AGE_S} s)`;
+                this._event('rejected', { plan, command: 'STALE_PLAN', reason });
+                return { accepted: false, plan, rejected, reason: 'stale', detail: reason };
             }
-            // Dispatch crisis event so the UI popup can react
-            window.dispatchEvent(new CustomEvent('safety-override', {
-                detail: {
-                    reason: safetyBlock,
-                    priority: 'EMERGENCY',
-                    plan_id: `safety_${Date.now()}`,
-                    summary: safetyBlock,
-                    commands: this._getSafetySequence(safetyBlock)
-                }
-            }));
-            return; // Do not execute queue while unsafe
         }
+        if (this.seenPlanIds.includes(plan.plan_id)) return { accepted: false, plan, rejected, reason: 'duplicate plan_id' };
+        this.seenPlanIds.push(plan.plan_id);
+        if (this.seenPlanIds.length > 50) this.seenPlanIds.shift();
+        if (!plan.commands.length) return { accepted: false, plan, rejected, reason: 'no executable commands' };
 
-        // 2. Queue Management
-        if (!this.currentCommand && this.queue.length > 0) {
-            // Sort queue by priority: EMERGENCY > HIGH > NORMAL
-            this.queue.sort((a, b) => {
-                const val = p => p === 'EMERGENCY' ? 3 : p === 'HIGH' ? 2 : 1;
-                return val(b.priority) - val(a.priority);
-            });
-
-            this.currentCommand = this.queue.shift();
-            this.currentStepIndex = 0;
-            this.stepStartTime = Date.now();
-            console.log(`[FLIGHT OPS] Starting Plan Execution`, this.currentCommand);
+        if (plan.priority === 'CRITICAL') {
+            if (this.current) this.abortCurrent(`pre-empted by CRITICAL plan ${plan.plan_id}`);
+            this.queue = this.queue.filter(p => p.priority === 'CRITICAL');
         }
+        // Stable insert: higher priority first, FIFO within a priority.
+        const rank = PRIORITY_RANK[plan.priority];
+        const idx = this.queue.findIndex(p => PRIORITY_RANK[p.priority] < rank);
+        if (idx === -1) this.queue.push(plan); else this.queue.splice(idx, 0, plan);
+        // A higher-priority plan pre-empts a lower one that is still running.
+        if (this.current && PRIORITY_RANK[this.current.priority] < rank && this.current.priority !== 'CRITICAL') {
+            this.abortCurrent(`pre-empted by ${plan.priority} plan`);
+        }
+        this._event('queued', { plan });
+        return { accepted: true, plan, rejected };
+    }
 
-        // 3. Execution Step
-        if (this.currentCommand) {
-            this.executeCurrentStep(dtSeconds);
+    /** Back-compat alias. */
+    processAIPlan(raw) { return this.submitPlan(raw, raw?.source || 'planner'); }
+
+    abortCurrent(reason = 'aborted') {
+        if (this.sat.propulsion.isThrusting) this.sat.endBurn();
+        if (this.current) {
+            this._finish('aborted', reason);
         }
     }
 
-    executeCurrentStep(dtSeconds) {
-        const step = this.currentCommand.commands[this.currentStepIndex];
-        if (!step) {
-            // Plan finished
-            this.currentCommand = null;
-            return;
+    // ── per-tick ─────────────────────────────────────────────────────────────
+    tick(dt) {
+        this._supervise();
+        if (this.sat.obcDown) return; // computer rebooting: nothing executes
+
+        if (!this.current && this.queue.length) {
+            this.current = this.queue.shift();
+            this.stepIndex = 0;
+            this.stepElapsed = 0;
+            this.stepState = {};
+            this._event('started', { plan: this.current });
+        }
+        if (this.current) this._executeStep(dt);
+        this.currentCommand = this.current;
+        this.currentStepIndex = this.stepIndex;
+    }
+
+    // ── safety supervisor ────────────────────────────────────────────────────
+    _supervise() {
+        const s = this.sat.sections;
+        const sup = this.supervisor;
+
+        const hot = INTERNAL_NODES.filter(k => s[k].temperature >= THERMAL_LIMITS[k].critHi);
+        const cooled = INTERNAL_NODES.every(k => s[k].temperature < THERMAL_LIMITS[k].warnHi - 3);
+        if (!sup.thermal && hot.length) {
+            sup.thermal = true;
+            const actions = this._safeConfig('thermal');
+            this._override('THERMAL_LIMIT_OVERRIDE', `${hot.map(k => s[k].name).join(', ')} above qualified limit`, actions);
+        } else if (sup.thermal && cooled) {
+            sup.thermal = false;
+            this._clear('THERMAL_LIMIT_OVERRIDE', 'All internal temperatures back inside limits');
         }
 
-        const elapsedSeconds = (Date.now() - this.stepStartTime) / 1000;
-        const maxTime = step.duration || 60; // 60s fallback timeout
-
-        if (elapsedSeconds > maxTime && step.type !== 'PLAN_BURN') {
-            console.warn(`[FLIGHT OPS] Step timed out! Aborting plan.`);
-            this.abortCurrent();
-            return;
+        const soc = s.batteryBay.charge;
+        if (!sup.battery && (soc < 15 || s.batteryBay.brownout)) {
+            sup.battery = true;
+            const actions = this._safeConfig('battery');
+            this._override('BATTERY_CRITICAL_OVERRIDE', `Battery at ${soc.toFixed(0)}%`, actions);
+        } else if (sup.battery && soc > 30) {
+            sup.battery = false;
+            this._clear('BATTERY_CRITICAL_OVERRIDE', `Battery recovered to ${soc.toFixed(0)}%`);
         }
 
-        let stepComplete = false;
+        // Hold the safe configuration while latched (a plan may not undo it).
+        if (sup.thermal) {
+            if (!['DEEP_SPACE', 'MANEUVER_ALIGNMENT'].includes(this.sat.attitude.mode)) this.sat.setAttitudeMode('DEEP_SPACE');
+            if (s.payloadBay.state === 'ACTIVE') this.sat.setPayloadState('OFF');
+        } else if (sup.battery) {
+            if (!['SUN_TRACKING', 'MANEUVER_ALIGNMENT', 'SAFE_TUMBLE_STOP'].includes(this.sat.attitude.mode)) this.sat.setAttitudeMode('SUN_TRACKING');
+            if (s.payloadBay.state !== 'OFF') this.sat.setPayloadState('OFF');
+        }
+    }
 
-        // ACTUATOR LOGIC
+    _safeConfig(kind) {
+        const actions = [];
+        const cur = this.current?.commands[this.stepIndex];
+        if (cur && this._veto(cur)) this.abortCurrent(`conflicts with ${kind} safety override`);
+        if (kind === 'thermal') {
+            this.sat.setAttitudeMode('DEEP_SPACE');
+            actions.push({ type: 'SET_ATTITUDE_MODE', params: { target: 'DEEP_SPACE' } });
+            this.sat.setPayloadState('OFF');
+            actions.push({ type: 'SET_PAYLOAD_STATE', params: { state: 'OFF' } });
+        } else {
+            this.sat.setPowerMode('SURVIVAL');
+            actions.push({ type: 'SET_POWER_MODE', params: { mode: 'SURVIVAL' } });
+            this.sat.setPayloadState('OFF');
+            actions.push({ type: 'SET_PAYLOAD_STATE', params: { state: 'OFF' } });
+            if (!this.supervisor.thermal) {
+                this.sat.setAttitudeMode('SUN_TRACKING');
+                actions.push({ type: 'SET_ATTITUDE_MODE', params: { target: 'SUN_TRACKING' } });
+            }
+        }
+        return actions;
+    }
+
+    _override(code, why, actions) {
+        this.sat.emit('safety-override', {
+            code, reason: code, summary: `${why}. Supervisor applied safe configuration.`,
+            priority: 'CRITICAL', plan_id: `safety_${code}_${Math.round(this.sat.missionTime)}`,
+            commands: actions, applied: true, source: 'supervisor',
+        });
+    }
+
+    _clear(code, why) {
+        this.sat.emit('safety-clear', { code, summary: why });
+    }
+
+    /** Returns a reason string if the supervisor forbids this command right now. */
+    _veto(cmd) {
+        const sup = this.supervisor;
+        const p = cmd.params || {};
+        if (sup.thermal) {
+            if (cmd.type === 'SET_ATTITUDE_MODE' && !['DEEP_SPACE', 'MANEUVER_ALIGNMENT'].includes(p.target)) return 'thermal override holds sun-avoid attitude';
+            if (cmd.type === 'SET_PAYLOAD_STATE' && p.state === 'ACTIVE') return 'thermal override keeps payload off';
+            if (cmd.type === 'EXIT_SAFE_MODE') return 'thermal override active';
+        }
+        if (sup.battery) {
+            if (cmd.type === 'SET_ATTITUDE_MODE' && !['SUN_TRACKING', 'MANEUVER_ALIGNMENT', 'SAFE_TUMBLE_STOP'].includes(p.target)) return 'battery override holds sun-pointing';
+            if (cmd.type === 'SET_PAYLOAD_STATE' && p.state !== 'OFF') return 'battery override keeps payload off';
+            if (cmd.type === 'SET_POWER_MODE' && p.mode === 'NOMINAL') return 'battery override forbids NOMINAL power';
+            if (cmd.type === 'EXIT_SAFE_MODE') return 'battery override active';
+        }
+        if (cmd.type === 'PLAN_BURN') {
+            const avail = this.sat.propulsion.remainingDeltaV - this.sat.propulsion.reserveDeltaV;
+            if (p.delta_v > avail) return `Δv ${p.delta_v.toFixed(2)} m/s exceeds usable budget ${Math.max(0, avail).toFixed(2)} m/s (reserve ${this.sat.propulsion.reserveDeltaV} m/s)`;
+            const risk = this._burnRisk(p.vector, p.delta_v);
+            if (risk) return risk;
+        }
+        if (cmd.type === 'EXECUTE_BURN' && !this.pendingBurn) return 'no burn planned (PLAN_BURN must come first)';
+        return null;
+    }
+
+    /**
+     * Collision check for a burn of dv m/s along vecTRN = [prograde, radial, normal], fired now.
+     * Returns a reason string if it must not fly: the worst Pc over every upcoming event would
+     * be at or above the manoeuvre threshold and no lower than it is today. Burns with nothing
+     * in the screening window, and burns that leave everything under the threshold, pass.
+     */
+    _burnRisk(vecTRN, dv) {
+        const sat = this.sat;
+        const [t, r, n] = vecTRN.map(x => x * dv);
+        const a = sat.conjunctions.assessImpulse(r, t, n, sat.missionTime, meanMotion(sat.orbit.baseAltitude));
+        if (!a.n || a.worstAfter < PC_MANEUVER_THRESHOLD || a.worstAfter < a.worstBefore) return null;
+        return a.worstBefore >= PC_MANEUVER_THRESHOLD
+            ? `burn does not reduce the collision risk (worst Pc ${formatPc(a.worstBefore)} now, ${formatPc(a.worstAfter)} after, ${a.worstAfterId})`
+            : `burn would raise ${a.worstAfterId} to Pc ${formatPc(a.worstAfter)} (worst is ${formatPc(a.worstBefore)} now)`;
+    }
+
+    // ── step execution ───────────────────────────────────────────────────────
+    _executeStep(dt) {
+        const plan = this.current;
+        const step = plan.commands[this.stepIndex];
+        if (!step) { this._finish('completed'); return; }
+
+        if (this.stepElapsed === 0 && !this.stepState.checked) {
+            this.stepState.checked = true;
+            const veto = this._veto(step);
+            if (veto) {
+                this._event('vetoed', { plan, command: step.type, reason: veto });
+                this._advance();
+                return;
+            }
+        }
+        this.stepElapsed += dt;
+        const sat = this.sat;
+        const st = this.stepState;
+        let done = false;
+
         switch (step.type) {
             case 'SET_ATTITUDE_MODE':
-                const target = step.params?.target || 'INERTIAL_LOCK';
-
-                // Map logical targets to physical angles (simplified 1D ADCS)
-                if (target === 'SUN_TRACKING') this.sat.attitude.targetAngle = 0;
-                else if (target === 'EARTH_NADIR') this.sat.attitude.targetAngle = 90;
-                else if (target === 'DEEP_SPACE') this.sat.attitude.targetAngle = 180;
-                else if (target === 'VELOCITY_ALIGNED') this.sat.attitude.targetAngle = 270;
-
-                // For attitude commands, we consider the step "complete" if it reaches the angle 
-                // OR if it just runs for its stated duration (meaning "hold this attitude for X seconds").
-                if (step.duration) {
-                    if (elapsedSeconds >= step.duration) stepComplete = true;
-                } else {
-                    // If no duration, wait till converged
-                    if (Math.abs(this.sat.attitude.currentAngle - this.sat.attitude.targetAngle) < 5) stepComplete = true;
-                }
+                // Command on the first tick; judge convergence from the next tick on, once the
+                // attitude model has recomputed the error for the new target.
+                if (!st.started) { sat.setAttitudeMode(step.params.target); st.started = true; break; }
+                done = step.params.target === 'SAFE_TUMBLE_STOP' ? sat.attitude.tumbleRateDegS < 0.2 : sat.attitude.pointingErrorDeg < 2;
+                if (!done && this.stepElapsed > ATTITUDE_TIMEOUT_S) { this.abortCurrent('attitude slew timed out'); return; }
                 break;
 
             case 'PLAN_BURN':
-                // In a real system, this would queue a burn into a separate maneuver registry.
-                // For this sim, we just log it and mark complete instantly.
-                console.log(`[FLIGHT OPS] Burn Planned: ${step.params?.reason}, dv: ${step.params?.delta_v}`);
-                stepComplete = true;
+                this.pendingBurn = { vector: step.params.vector, deltaV: step.params.delta_v, delivered: 0, reason: step.params.reason };
+                this._event('burn-planned', { plan, burn: this.pendingBurn });
+                done = true;
                 break;
 
-            case 'EXECUTE_BURN':
-                // For simplicity in the sim, we'll actually execute thrust here if we find an adjacent PLAN_BURN, 
-                // or just apply a default thrust if commanded directly.
-                // We'll look back at the previous step for params if executing.
-                let dv = 0.5; // default
-                let dir = [1, 0, 0]; // prograde
-                if (this.currentStepIndex > 0 && this.currentCommand.commands[this.currentStepIndex - 1].type === 'PLAN_BURN') {
-                    const plan = this.currentCommand.commands[this.currentStepIndex - 1].params;
-                    dv = plan.delta_v || 0.5;
-                    dir = plan.vector || [1, 0, 0];
+            case 'EXECUTE_BURN': {
+                const b = this.pendingBurn;
+                if (!st.phase) {
+                    sat.setBurnDirection(b.vector);
+                    sat.setAttitudeMode('MANEUVER_ALIGNMENT');
+                    st.phase = 'align';
+                    break; // alignment is judged from the next tick (fresh pointing error)
                 }
-
-                const burnSec = step.duration || 5.0;
-
-                // Start burn
-                this.sat.propulsion.isThrusting = true;
-
-                if (elapsedSeconds <= burnSec) {
-                    // Apply thrust (dv/dt)
-                    this.sat.applyThrust(dir, dv / burnSec * dtSeconds);
-                } else {
-                    // Burn complete
-                    this.sat.propulsion.isThrusting = false;
-                    stepComplete = true;
+                if (st.phase === 'align') {
+                    if (sat.thrusterAligned()) {
+                        // The slew took time and the picture may have changed: check once more before firing.
+                        const risk = this._burnRisk(b.vector, b.deltaV);
+                        if (risk) {
+                            this._event('vetoed', { plan, command: 'EXECUTE_BURN', reason: risk });
+                            this.abortCurrent('burn failed the pre-fire collision check');
+                            return;
+                        }
+                        st.phase = 'burn'; st.burnStart = this.stepElapsed;
+                    }
+                    else if (this.stepElapsed > ALIGN_TIMEOUT_S) { this.abortCurrent('thruster alignment timed out'); return; }
+                }
+                if (st.phase === 'burn') {
+                    const left = b.deltaV - b.delivered;
+                    const got = sat.applyThrust(b.vector, dt, left);
+                    b.delivered += got;
+                    if (got <= 0) { this.abortCurrent('propellant exhausted'); return; }
+                    if (b.deltaV - b.delivered < 1e-6) {
+                        sat.endBurn();
+                        this._event('burn-complete', { plan, burn: b });
+                        this.pendingBurn = null;
+                        done = true;
+                    }
                 }
                 break;
+            }
 
             case 'SET_POWER_MODE':
-                const mode = step.params?.mode || 'NOMINAL';
-                if (mode === 'LOW_POWER' || mode === 'SURVIVAL') {
-                    this.sat.sections.payload.powerDraw = 2; // Nominal is usually 20
-                } else if (mode === 'CHARGE_PRIORITY') {
-                    this.sat.sections.payload.powerDraw = 5;
-                } else {
-                    this.sat.sections.payload.powerDraw = 20; // NOMINAL
-                }
-                stepComplete = true; // State change is instant
+                sat.setPowerMode(step.params.mode);
+                done = true;
                 break;
 
             case 'SET_PAYLOAD_STATE':
-                const pstate = step.params?.state || 'ACTIVE';
-                if (pstate === 'OFF') {
-                    this.sat.sections.payload.powerDraw = 0;
-                    this.sat.sections.payload.status = 'OFFLINE';
-                } else if (pstate === 'ACTIVE') {
-                    this.sat.sections.payload.powerDraw = 20;
-                    this.sat.sections.payload.status = 'ONLINE';
-                }
-                stepComplete = true;
+                sat.setPayloadState(step.params.state);
+                done = true;
                 break;
 
             case 'ENTER_SAFE_MODE':
-                this.sat.sections.payload.powerDraw = 0;
-                this.sat.sections.payload.status = 'OFFLINE';
-                this.sat.attitude.targetAngle = 0; // Sun point
-                this.sat.sections.commArray.linkStatus = 'LOW_BANDWIDTH';
-                stepComplete = true;
+                sat.setPowerMode('SURVIVAL');
+                sat.setPayloadState('OFF');
+                if (!this.supervisor.thermal) sat.setAttitudeMode('SUN_TRACKING');
+                done = true;
                 break;
 
             case 'EXIT_SAFE_MODE':
-                this.sat.sections.payload.powerDraw = 20;
-                this.sat.sections.payload.status = 'ONLINE';
-                this.sat.sections.commArray.linkStatus = 'STRONG';
-                stepComplete = true;
+                sat.setPowerMode('NOMINAL');
+                sat.setPayloadState('ACTIVE');
+                done = true;
                 break;
 
+            case 'RESET_OBC':
+                this._advance();
+                sat.resetObc(); // aborts this plan as the computer reboots
+                return;
+
             default:
-                console.warn("[FLIGHT OPS] Unknown action type: ", step.type);
-                stepComplete = true;
+                done = true;
         }
-
-        // Expose elapsed for the UI progress bar tracking
-        this.currentCommand.elapsed = elapsedSeconds;
-
-        if (stepComplete) {
-            this.currentStepIndex++;
-            this.stepStartTime = Date.now();
-        }
+        if (done) this._advance();
     }
 
-    /**
-     * Hard limits - Never trust AI
-     * @returns {string|null} Reason for safety block, or null if safe
-     */
-    checkSafetyConstraints() {
-        const bat = this.sat.sections.batteryBay.percent;
-        const temp = this.sat.sections.batteryBay.temperature;
-
-        // Auto-survival: If dying, force safe mode regardless of AI plan
-        if (bat < 15) {
-            this.sat.attitude.targetAngle = 0; // Force Sun point
-            this.sat.sections.payload.status = 'OFFLINE';
-            return "BATTERY_CRITICAL_OVERRIDE";
-        }
-
-        if (temp > 85) {
-            this.sat.attitude.targetAngle = 180; // Force Shadow
-            return "THERMAL_LIMIT_OVERRIDE";
-        }
-
-        if (this.currentCommand && this.currentCommand.commands[this.currentStepIndex]?.type === 'EXECUTE_BURN') {
-            // Check Delta V reserve before allowing burn
-            // We look back at plan_burns for the requested dv
-            const requestedTotalDv = this.currentCommand.commands
-                .filter(s => s.type === 'PLAN_BURN')
-                .reduce((sum, s) => sum + (s.params?.delta_v || 0), 0);
-
-            if (this.sat.propulsion.remainingDeltaV - requestedTotalDv < 50) {
-                return "FUEL_RESERVE_OVERRIDE"; // Need 50m/s to de-orbit safely
-            }
-        }
-
-        return null; // Safe to proceed
+    _advance() {
+        this.stepIndex += 1;
+        this.stepElapsed = 0;
+        this.stepState = {};
+        if (this.current && this.stepIndex >= this.current.commands.length) this._finish('completed');
     }
 
-    /**
-     * Map safety override codes to human-readable action sequences for the Crisis Alert popup.
-     */
-    _getSafetySequence(overrideCode) {
-        switch (overrideCode) {
-            case 'BATTERY_CRITICAL_OVERRIDE':
-                return [
-                    { type: 'ENTER_SAFE_MODE', params: {} },
-                    { type: 'SET_ATTITUDE_MODE', params: { target: 'SUN_TRACKING' }, duration: 60 }
-                ];
-            case 'THERMAL_LIMIT_OVERRIDE':
-                return [
-                    { type: 'SET_ATTITUDE_MODE', params: { target: 'DEEP_SPACE' }, duration: 60 }
-                ];
-            case 'FUEL_RESERVE_OVERRIDE':
-                return [
-                    { type: 'SET_ATTITUDE_MODE', params: { target: 'INERTIAL_LOCK' }, duration: 30 }
-                ];
-            default:
-                return [{ type: 'SET_ATTITUDE_MODE', params: { target: 'INERTIAL_LOCK' }, duration: 30 }];
-        }
+    _finish(outcome, reason) {
+        const plan = this.current;
+        this.current = null;
+        this.currentCommand = null;
+        this.stepIndex = 0;
+        this.stepElapsed = 0;
+        this.stepState = {};
+        if (outcome === 'aborted') this.pendingBurn = null; // never leave a stale burn armed
+        this.recent.unshift({ plan_id: plan.plan_id, summary: plan.summary, priority: plan.priority, outcome, reason, at: this.sat.missionTime });
+        this.recent.length = Math.min(this.recent.length, 10);
+        this._event(outcome, { plan, reason });
+    }
+
+    _event(kind, detail) {
+        this.sat.emit('plan', { kind, ...detail, t: this.sat.missionTime });
+    }
+
+    /** UI-friendly snapshot of what the controller is doing. */
+    status() {
+        const p = this.current;
+        const step = p?.commands[this.stepIndex];
+        let fraction = 0;
+        if (step?.type === 'EXECUTE_BURN' && this.pendingBurn) fraction = this.pendingBurn.delivered / this.pendingBurn.deltaV;
+        else if (step?.type === 'SET_ATTITUDE_MODE') fraction = Math.max(0, 1 - this.sat.attitude.pointingErrorDeg / 180);
+        return {
+            plan: p ? { plan_id: p.plan_id, priority: p.priority, summary: p.summary, source: p.source, commands: p.commands } : null,
+            stepIndex: this.stepIndex,
+            stepType: step?.type || null,
+            stepPhase: this.stepState.phase || null,
+            stepFraction: fraction,
+            queue: this.queue.map(q => ({ plan_id: q.plan_id, priority: q.priority, summary: q.summary, n: q.commands.length })),
+            pendingBurn: this.pendingBurn,
+            supervisor: { ...this.supervisor },
+            recent: this.recent,
+            paused: this.sat.obcDown,
+        };
     }
 }
