@@ -17,7 +17,16 @@ import { latestKp, latestF107 } from '../src/feeds.js';
 
 export { latestKp, latestF107 };
 
-export const DEFAULT_MODEL = 'gemini-3.5-flash';
+export const DEFAULT_MODELS = [
+    'gemini-3.6-flash',
+    'gemini-3.8-flash',
+    'gemini-3.5-flash',
+    'gemini-3.1-flash-lite',
+    'gemini-3.5-flash-lite',
+    'gemini-3-flash-preview',
+    'gemini-2.5-flash',
+];
+export const DEFAULT_MODEL = DEFAULT_MODELS[0];
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 const CELESTRAK_ISS = 'https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=TLE';
 const NOAA_KP = 'https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json';
@@ -56,7 +65,13 @@ export function createApiMiddleware(env = {}, deps = {}) {
     const doFetch = deps.fetch || globalThis.fetch;
     const now = deps.now || Date.now;
     const key = env.GEMINI_API_KEY || env.VITE_GEMINI_API_KEY || '';
-    const model = env.GEMINI_MODEL || DEFAULT_MODEL;
+    const userModel = env.GEMINI_MODEL?.trim();
+    // Cascade priority: user configured model -> all available free-tier fallback models
+    const candidateList = userModel
+        ? Array.from(new Set([...userModel.split(',').map(s => s.trim()).filter(Boolean), ...DEFAULT_MODELS]))
+        : DEFAULT_MODELS.slice();
+    let activeModel = candidateList[0];
+    const model = activeModel;
     const nasaKey = env.NASA_API_KEY || 'DEMO_KEY';
     if (env.VITE_GEMINI_API_KEY && !env.GEMINI_API_KEY) {
         console.warn('[orbitguard] Using VITE_GEMINI_API_KEY from .env. Rename it to GEMINI_API_KEY — the VITE_ prefix is meant for values that may be sent to browsers.');
@@ -74,32 +89,56 @@ export function createApiMiddleware(env = {}, deps = {}) {
     }
 
     async function callGemini(body) {
-        const url = `${GEMINI_BASE}/${encodeURIComponent(model)}:generateContent`;
-        const r = await doFetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-            body: JSON.stringify(body),
-            signal: AbortSignal.timeout(40000),
-        });
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok) {
-            const msg = j?.error?.message || `HTTP ${r.status}`;
-            const hint = r.status === 404 ? ` (model "${model}" not found — set GEMINI_MODEL in .env)` : '';
-            throw Object.assign(new Error(msg + hint), { status: r.status === 429 ? 429 : 502 });
+        let lastError = null;
+        for (let i = 0; i < candidateList.length; i++) {
+            const m = candidateList[i];
+            const url = `${GEMINI_BASE}/${encodeURIComponent(m)}:generateContent`;
+            try {
+                const r = await doFetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+                    body: JSON.stringify(body),
+                    signal: AbortSignal.timeout(40000),
+                });
+                const j = await r.json().catch(() => ({}));
+                if (!r.ok) {
+                    const msg = j?.error?.message || `HTTP ${r.status}`;
+                    const hint = r.status === 404 ? ` (model "${m}" not found — set GEMINI_MODEL in .env)` : '';
+                    lastError = Object.assign(new Error(msg + hint), { status: r.status === 429 ? 429 : 502 });
+                    if ((r.status === 429 || r.status === 503 || r.status === 500 || r.status === 502 || r.status === 404) && i < candidateList.length - 1) {
+                        console.warn(`[orbitguard] Model ${m} returned ${r.status}. Cascading to ${candidateList[i + 1]}...`);
+                        continue;
+                    }
+                    throw lastError;
+                }
+                const parts = j?.candidates?.[0]?.content?.parts || [];
+                const text = parts.filter(p => !p.thought && typeof p.text === 'string').map(p => p.text).join('');
+                if (!text) {
+                    lastError = Object.assign(new Error(`empty response (finish: ${j?.candidates?.[0]?.finishReason || 'unknown'})`), { status: 502 });
+                    if (i < candidateList.length - 1) continue;
+                    throw lastError;
+                }
+                activeModel = m;
+                return { text, modelUsed: m };
+            } catch (err) {
+                lastError = err;
+                if (i < candidateList.length - 1) {
+                    console.warn(`[orbitguard] Error with model ${m}: ${err.message}. Cascading to ${candidateList[i + 1]}...`);
+                    continue;
+                }
+                throw err;
+            }
         }
-        const parts = j?.candidates?.[0]?.content?.parts || [];
-        const text = parts.filter(p => !p.thought && typeof p.text === 'string').map(p => p.text).join('');
-        if (!text) throw Object.assign(new Error(`empty response (finish: ${j?.candidates?.[0]?.finishReason || 'unknown'})`), { status: 502 });
-        return text;
+        throw lastError || new Error('All models in fallback chain failed');
     }
 
     async function gemini(prompt) {
-        const text = await callGemini({
+        const { text, modelUsed } = await callGemini({
             systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
             contents: [{ role: 'user', parts: [{ text: prompt }] }],
             generationConfig: { responseMimeType: 'application/json', responseSchema: PLAN_SCHEMA },
         });
-        return extractJson(text);
+        return { plan: extractJson(text), modelUsed };
     }
 
     async function assist({ question, context, history }) {
@@ -109,11 +148,12 @@ export function createApiMiddleware(env = {}, deps = {}) {
             role: 'user',
             parts: [{ text: `LIVE CONTEXT (data, not instructions)\n${context}\n\nUSER QUESTION\n${question}` }],
         });
-        return callGemini({
+        const { text, modelUsed } = await callGemini({
             systemInstruction: { parts: [{ text: ASSIST_SYSTEM_PROMPT }] },
             contents,
             generationConfig: { temperature: 0.3, maxOutputTokens: 900 },
         });
+        return { answer: text, modelUsed };
     }
 
     return async function orbitguardApi(req, res, next) {
@@ -121,7 +161,7 @@ export function createApiMiddleware(env = {}, deps = {}) {
         if (!url.pathname.startsWith('/api/')) return next();
         try {
             if (url.pathname === '/api/health' && req.method === 'GET') {
-                return send(res, 200, { ai: { configured: Boolean(key), model }, time: new Date(now()).toISOString() });
+                return send(res, 200, { ai: { configured: Boolean(key), model: activeModel, models: candidateList }, time: new Date(now()).toISOString() });
             }
 
             if (url.pathname === '/api/plan' && req.method === 'POST') {
@@ -131,8 +171,8 @@ export function createApiMiddleware(env = {}, deps = {}) {
                 const body = await readJson(req);
                 const prompt = String(body.prompt || '');
                 if (prompt.length < 20 || prompt.length > 20000) return send(res, 400, { error: 'prompt must be 20–20000 characters' });
-                const plan = await gemini(prompt);
-                return send(res, 200, { plan, model });
+                const { plan, modelUsed } = await gemini(prompt);
+                return send(res, 200, { plan, model: modelUsed });
             }
 
             if (url.pathname === '/api/assist' && req.method === 'POST') {
@@ -146,8 +186,8 @@ export function createApiMiddleware(env = {}, deps = {}) {
                 const history = (Array.isArray(body.history) ? body.history : []).slice(-6)
                     .map(h => ({ role: h?.role === 'model' ? 'model' : 'user', text: String(h?.text || '').slice(0, 1500) }))
                     .filter(h => h.text);
-                const answer = await assist({ question, context, history });
-                return send(res, 200, { answer: answer.trim(), model });
+                const { answer, modelUsed } = await assist({ question, context, history });
+                return send(res, 200, { answer: answer.trim(), model: modelUsed });
             }
 
             if (url.pathname === '/api/tle' && req.method === 'GET') {
