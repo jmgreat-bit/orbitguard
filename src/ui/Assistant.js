@@ -45,7 +45,10 @@ export function initAssistant() {
       <section class="assistant-panel" id="assistant-panel" role="dialog" aria-label="OrbitGuard assistant" hidden>
         <header>
           <div><strong>Ask OrbitGuard</strong><span class="assistant-mode" id="assistant-mode"></span></div>
-          <button class="icon-btn" id="assistant-close" aria-label="Close assistant">×</button>
+          <div class="assistant-actions">
+            <button class="icon-btn" id="assistant-expand" aria-label="Expand assistant panel" title="Expand / shrink panel">⛶</button>
+            <button class="icon-btn" id="assistant-close" aria-label="Close assistant">×</button>
+          </div>
         </header>
         <div class="assistant-msgs" id="assistant-msgs" aria-live="polite"></div>
         <div class="assistant-chips" id="assistant-chips"></div>
@@ -136,6 +139,12 @@ export function initAssistant() {
 
     fab.addEventListener('click', () => open(panel.hidden));
     $('assistant-close').addEventListener('click', () => open(false));
+    $('assistant-expand')?.addEventListener('click', () => {
+        panel.classList.toggle('expanded');
+        const isExp = panel.classList.contains('expanded');
+        $('assistant-expand').textContent = isExp ? '🗗' : '⛶';
+        $('assistant-expand').setAttribute('title', isExp ? 'Collapse panel' : 'Expand panel');
+    });
     root.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !panel.hidden) { e.stopPropagation(); open(false); } });
     $('assistant-form').addEventListener('submit', (e) => { e.preventDefault(); const v = input.value; input.value = ''; ask(v); });
 
